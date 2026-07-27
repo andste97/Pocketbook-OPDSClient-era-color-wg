@@ -13,6 +13,7 @@ An OPDS catalog client built in C for PocketBook e-readers. This application all
 * **Search Support:** Compatible with standard OPDS search endpoints and OpenSearch. Includes URL encoding to handle multi-word searches on Python-based servers like Calibre-Web.
 * **Continuous Pagination:** Tracks page numbers across server batches to provide a seamless browsing experience.
 * **Network Handling:** Uses connection reuse, automatically resolves relative URLs, and implements 30-second timeouts to handle unresponsive servers without freezing the device.
+* **Authelia Cookie Authentication:** Supports an in-app Authelia password and TOTP login, persistent session cookies, automatic session-expiry detection, and login resumption for interrupted catalog loads and book downloads.
 * **Downloads:** Books are downloaded directly to the device's storage. 
   * *Note on Library Integration:* Books downloaded via the app may not automatically appear in the native PocketBook Library app. You may need to trigger a library rescan or use an external script (such as an `iv2sh` command) to force the OS to index the new files.
 
@@ -44,6 +45,78 @@ The application supports both touchscreen input and hardware button navigation.
 | **Prev Page** | Load the previous page. | Scroll up the book summary text. |
 | **Menu / Home**| Opens a number pad allowing you to jump to a specific page. Supports "Time Machine" jumping back to previously loaded batches. | *No action* |
 
+## Authelia ForwardAuth
+
+The client supports Authelia's cookie-based ForwardAuth flow when HTTP Basic authentication is not available. It performs the same first-factor and TOTP API sequence as Authelia's official PAM client:
+
+1. `POST /api/firstfactor` with the entered username and password.
+2. `GET /api/user/info` to confirm TOTP enrollment.
+3. `POST /api/secondfactor/totp` with the entered code.
+4. Store the resulting session in a per-server libcurl cookie jar.
+
+The username, password, and TOTP code are kept only in temporary memory and cleared after login. The session cookie is persisted in `/mnt/ext1/applications/OPDSClient/auth/` until it expires, is revoked, the server is deleted, the authentication mode changes, or **Log Out** is selected. The app requests Authelia's configured `remember_me` lifetime.
+
+### Authelia requirements
+
+The Authelia session cookie domain must cover both the authentication portal and OPDS host. For example, `auth.example.com` and `books.example.com` can share a cookie configured for `example.com`. Hosts on unrelated domains cannot use this flow.
+
+```yaml
+server:
+  endpoints:
+    authz:
+      forward-auth:
+        implementation: ForwardAuth
+        authn_strategies:
+          - name: CookieSession
+
+session:
+  cookies:
+    - domain: example.com
+      authelia_url: https://auth.example.com
+      default_redirection_url: https://books.example.com
+      remember_me: 1M
+
+access_control:
+  default_policy: deny
+  rules:
+    - domain: books.example.com
+      policy: two_factor
+```
+
+Both URLs must use HTTPS. The client verifies TLS certificates with the PocketBook system trust store.
+
+### Traefik requirements
+
+Traefik must forward the incoming `Cookie` header to Authelia. ForwardAuth sends all request headers when `authRequestHeaders` is omitted; if it is configured, include `Cookie`. Configure `addAuthCookiesToResponse` so refreshed Authelia cookies are returned to the client:
+
+```yaml
+http:
+  middlewares:
+    authelia:
+      forwardAuth:
+        address: http://authelia:9091/api/authz/forward-auth
+        authRequestHeaders:
+          - Cookie
+        addAuthCookiesToResponse:
+          - authelia_session
+```
+
+Use your configured session-cookie name if it differs from `authelia_session`.
+
+### PocketBook setup
+
+1. Add or edit the OPDS server normally.
+2. Open the server and select **Authentication**.
+3. Tap the mode button until it shows **Authelia Cookie**.
+4. Enter the Authelia portal URL, such as `https://auth.example.com`.
+5. Select **Log In / Refresh**, then enter the Authelia username, password, and TOTP code.
+6. Browse the catalog. Expired sessions return to the authentication screen and the interrupted catalog request or download resumes after login.
+
+Only password plus TOTP is supported. Duo, WebAuthn/passkeys, browser-cookie import, and OAuth device authorization are not currently implemented.
+
+> [!WARNING]
+> The persisted session cookie is a bearer credential and is stored unencrypted on the PocketBook filesystem because the SDK provides no secure credential store. Use **Log Out** before transferring or disposing of the device.
+
 ---
 
 ## Debug Logging
@@ -53,7 +126,7 @@ The app logs network requests and errors if a trigger file is present.
 **To enable and access logs:**
 1. Create an empty file named `LOGTRIGGER.TXT` in the app's installation folder (`/mnt/ext1/applications/OPDSClient/`).
 2. Run the application and perform the actions you wish to log.
-3. Open the `opds_client.log` file on your computer. This file contains `libcurl` network traces, HTTP headers, and redirect information.
+3. Open the `opds_client.log` file on your computer. This file contains `libcurl` network traces, HTTP headers, and redirect information. Authorization and cookie values are redacted.
 
 I have tested on a Pocketbook ERA and Inkpad Color 3. I made the UI scalable but have not tested on any older or lower resolution devices.
 
@@ -69,6 +142,7 @@ Dependencies required to compile:
 * `libinkview` (PocketBook UI)
 * `libcurl` (Networking)
 * `libxml2` (OPDS Parsing)
+* `json-c` (Authelia API responses)
 * `freetype2` (Font Rendering)
 * `stb_image.h` (Included header for decoding images)
 
@@ -87,6 +161,18 @@ docker run --rm \
 ```
 
 The resulting application is `OPDSClient.app`.
+
+## Unit Tests
+
+Every application logic component has host-runnable unit coverage, including configuration normalization, authentication state and retry actions, Authelia password/TOTP responses, persistent cookie handling, cross-origin cookie isolation, network result classification and redaction, and OPDS parsing.
+
+Run the complete suite with:
+
+```bash
+make test
+```
+
+The test target builds a dedicated Docker image from `tests/Dockerfile`, compiles the logic natively with strict warnings, starts deterministic mock Authelia/OPDS endpoints, and runs all assertions. The unit suite and PocketBook SDK cross-compilation are separate required checks because host tests cannot validate InkView or target ABI integration.
 
 ## Automated Releases
 

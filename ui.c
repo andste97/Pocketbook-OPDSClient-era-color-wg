@@ -49,6 +49,9 @@ static int view_x = 0;
 static int view_y = 0;
 static int view_w = 0;
 static int view_h = 0;
+static AuthFlowContext auth_flow;
+static AuthPendingAction pending_auth_action = {AUTH_PENDING_NONE, {0}, -1};
+static char auth_url_backup[MAX_STR_LEN];
 
 void SetTextFont(int size, int color);
 void DrawButton(int x, int y, int w, int h, const char *text, int is_dark);
@@ -58,6 +61,8 @@ void GoBackInHierarchy();
 void FetchThumbnailsForPage();
 void ManageImageCache(); 
 void JIT_DecodePageThumbnails(); 
+static void DownloadSelectedFormat(int format_index);
+void PerformSearch(char *text);
 
 // --- NEW: Bulletproof Aggressive Dark Mode Detection ---
 int IsDarkMode() {
@@ -295,6 +300,7 @@ int EnsureNetwork() {
 void EnsureDirectories() {
     mkdir(APP_ROOT_DIR, 0777);
     mkdir(IMAGES_DIR, 0777);
+    mkdir(AUTH_DIR, 0700);
     mkdir(BOOKS_DIR, 0777); 
 }
 
@@ -540,6 +546,134 @@ void SeparateTags(char *text) {
 
 void KbdCallback(char *text) { Repaint(); }
 
+static void AuthURLCallback(char *text) {
+    if (text && current_server_index >= 0 && current_server_index < server_count) {
+        servers[current_server_index].auth_url[MAX_STR_LEN - 1] = '\0';
+        if (SaveServers() != 0) {
+            strncpy(servers[current_server_index].auth_url, auth_url_backup, MAX_STR_LEN - 1);
+            servers[current_server_index].auth_url[MAX_STR_LEN - 1] = '\0';
+            Message(ICON_ERROR, "Save Failed", "Unable to save the Authelia URL.", 3000);
+        } else if (strcmp(servers[current_server_index].auth_url, auth_url_backup) != 0 &&
+                   AuthDeleteCookieJar(current_server_index) != 0) {
+            Message(ICON_ERROR, "Session Cleanup Failed",
+                    "The URL was saved, but the old session could not be removed.", 3500);
+        }
+    }
+    Repaint();
+}
+
+static void AuthTOTPCallback(char *text);
+
+static void AuthPasswordCallback(char *text) {
+    if (AuthFlowSetPassword(&auth_flow, text) != 0) {
+        AuthFlowCancel(&auth_flow);
+        Repaint();
+        return;
+    }
+
+    AutheliaResult result = AutheliaFirstFactor(&servers[current_server_index],
+                                                current_server_index,
+                                                auth_flow.username,
+                                                auth_flow.password);
+    SecureZero(auth_flow.password, sizeof(auth_flow.password));
+    if (result != AUTHELIA_OK) {
+        Message(ICON_ERROR, "Authelia Login", AutheliaResultMessage(result), 4000);
+        AuthFlowCancel(&auth_flow);
+        Repaint();
+        return;
+    }
+
+    SecureZero(auth_flow.totp, sizeof(auth_flow.totp));
+    OpenKeyboard("Authelia TOTP", auth_flow.totp, (int)sizeof(auth_flow.totp) - 1,
+                 KBD_NUMERIC, AuthTOTPCallback);
+}
+
+static void AuthUsernameCallback(char *text) {
+    if (AuthFlowSetUsername(&auth_flow, text) != 0) {
+        AuthFlowCancel(&auth_flow);
+        Repaint();
+        return;
+    }
+
+    SecureZero(auth_flow.password, sizeof(auth_flow.password));
+    OpenKeyboard("Authelia Password", auth_flow.password,
+                 (int)sizeof(auth_flow.password) - 1,
+                 KBD_PASSWORD, AuthPasswordCallback);
+}
+
+static void AuthTOTPCallback(char *text) {
+    if (AuthFlowSetTOTP(&auth_flow, text) != 0) {
+        Message(ICON_ERROR, "Invalid TOTP", "Enter a 6- or 8-digit code.", 3000);
+        AuthCancelLogin(current_server_index);
+        AuthFlowCancel(&auth_flow);
+        Repaint();
+        return;
+    }
+
+    AutheliaResult result = AutheliaCompleteTOTP(&servers[current_server_index],
+                                                 current_server_index,
+                                                 auth_flow.totp);
+    AuthFlowCancel(&auth_flow);
+    if (result != AUTHELIA_OK) {
+        Message(ICON_ERROR, "Authelia Login", AutheliaResultMessage(result), 4000);
+        Repaint();
+        return;
+    }
+
+    if (pending_auth_action.type == AUTH_PENDING_CATALOG) {
+        char retry_url[MAX_STR_LEN];
+        strncpy(retry_url, pending_auth_action.url, sizeof(retry_url) - 1);
+        retry_url[sizeof(retry_url) - 1] = '\0';
+        AuthPendingClear(&pending_auth_action);
+        LoadCatalog(retry_url);
+        return;
+    }
+    if (pending_auth_action.type == AUTH_PENDING_BOOK) {
+        int format_index = pending_auth_action.format_index;
+        AuthPendingClear(&pending_auth_action);
+        current_state = STATE_BOOK_DETAILS;
+        Repaint();
+        DownloadSelectedFormat(format_index);
+        return;
+    }
+    if (pending_auth_action.type == AUTH_PENDING_SEARCH) {
+        char query[MAX_STR_LEN];
+        strncpy(query, pending_auth_action.url, sizeof(query) - 1);
+        query[sizeof(query) - 1] = '\0';
+        AuthPendingClear(&pending_auth_action);
+        current_state = STATE_BROWSING;
+        PerformSearch(query);
+        SecureZero(query, sizeof(query));
+        return;
+    }
+    Message(ICON_INFORMATION, "Authelia Login", "Session established.", 2500);
+    Repaint();
+}
+
+void CancelAuthUI() {
+    AuthFlowCancel(&auth_flow);
+    AuthPendingClear(&pending_auth_action);
+    if (current_server_index >= 0 && current_server_index < server_count) {
+        AuthCancelLogin(current_server_index);
+    }
+}
+
+static void StartAutheliaLogin(void) {
+    OPDSServer *server = &servers[current_server_index];
+    if (server->auth_mode != AUTH_MODE_AUTHELIA_COOKIE ||
+        strncmp(server->auth_url, "https://", 8) != 0) {
+        Message(ICON_ERROR, "Authelia Configuration",
+                "Select Authelia Cookie and enter an HTTPS Authelia URL.", 4000);
+        return;
+    }
+    if (EnsureNetwork() != 0) return;
+
+    AuthFlowStart(&auth_flow);
+    OpenKeyboard("Authelia Username", auth_flow.username,
+                 (int)sizeof(auth_flow.username) - 1,
+                 KBD_NORMAL, AuthUsernameCallback);
+}
+
 void JumpToPageCallback(char *text) {
     if (!text || strlen(text) == 0) { Repaint(); return; }
     
@@ -631,7 +765,9 @@ void FetchThumbnailsForPage() {
             snprintf(t_path, sizeof(t_path), "%scache_%lu.jpg", IMAGES_DIR, hash_str(current_entries[i].thumb_url));
 
             struct stat st;
-            if (stat(t_path, &st) == 0 || DownloadImage(current_entries[i].thumb_url, t_path, servers[current_server_index].user, servers[current_server_index].pass) == 0) {
+            if (stat(t_path, &st) == 0 ||
+                DownloadImage(current_entries[i].thumb_url, t_path,
+                              &servers[current_server_index], current_server_index) == NETWORK_OK) {
                 list_thumbs[i] = LoadCoverSTB(t_path);
                 if (list_thumbs[i]) {
                     int row_index = i - start;
@@ -670,7 +806,9 @@ void LoadCatalog(const char *url) {
     last_loaded_url[MAX_STR_LEN - 1] = '\0';
     
     struct MemoryStruct chunk;
-    if (FetchFeed(last_loaded_url, servers[current_server_index].user, servers[current_server_index].pass, &chunk) == 0) {
+    NetworkResult fetch_result = FetchFeed(last_loaded_url, &servers[current_server_index],
+                                           current_server_index, &chunk);
+    if (fetch_result == NETWORK_OK) {
         memset(current_entries, 0, sizeof(OPDSEntry) * MAX_ENTRIES);
         entry_count = 0; 
  
@@ -704,9 +842,23 @@ void LoadCatalog(const char *url) {
         JIT_DecodePageThumbnails();
         Repaint(); 
         FetchThumbnailsForPage();
-    } else { 
+    } else if (fetch_result == NETWORK_AUTH_REQUIRED) {
+        entry_count = 0;
+        AuthPendingSetCatalog(&pending_auth_action, last_loaded_url);
+        Message(ICON_ERROR, "Authentication Required",
+                "The Authelia session is missing or expired. Log in again.", 3500);
+        current_state = STATE_AUTH_SETTINGS;
+        Repaint();
+    } else {
         entry_count = 0; 
         current_state = STATE_BROWSING;
+        if (fetch_result == NETWORK_TLS_ERROR) {
+            Message(ICON_ERROR, "TLS Error", "The server certificate could not be verified.", 3500);
+        } else if (fetch_result == NETWORK_HTTP_ERROR) {
+            Message(ICON_ERROR, "Server Error", "The OPDS server returned an HTTP error.", 3000);
+        } else {
+            Message(ICON_ERROR, "Network Error", "Unable to load the OPDS catalog.", 3000);
+        }
         Repaint();
     }
 
@@ -741,7 +893,9 @@ void PerformSearch(char *text) {
 
     if (is_opensearch_url) {
         struct MemoryStruct osd_chunk;
-        if (FetchFeed(current_search_url, servers[current_server_index].user, servers[current_server_index].pass, &osd_chunk) == 0) {
+        NetworkResult result = FetchFeed(current_search_url, &servers[current_server_index],
+                                         current_server_index, &osd_chunk);
+        if (result == NETWORK_OK) {
             char new_template[MAX_STR_LEN] = {0};
             if (ParseOpenSearch(osd_chunk.memory, current_search_url, new_template) == 0) {
                 strncpy(current_search_url, new_template, MAX_STR_LEN - 1);
@@ -749,6 +903,20 @@ void PerformSearch(char *text) {
                 is_opensearch_url = 0; 
             }
             free(osd_chunk.memory);
+        } else if (result == NETWORK_AUTH_REQUIRED) {
+            AuthPendingSetSearch(&pending_auth_action, text);
+            Message(ICON_ERROR, "Authentication Required",
+                    "The Authelia session expired. Log in to resume the search.", 3500);
+            current_state = STATE_AUTH_SETTINGS;
+            Repaint();
+            return;
+        } else {
+            Message(ICON_ERROR, result == NETWORK_TLS_ERROR ? "TLS Error" : "Search Error",
+                    result == NETWORK_TLS_ERROR ?
+                    "The search server certificate could not be verified." :
+                    "Unable to load the OPDS search description.", 3500);
+            Repaint();
+            return;
         }
     }
 
@@ -827,6 +995,7 @@ void HandleMainMenuTouch(int x, int y) {
         if (y >= list_y && y <= list_y + row_h) {
             FlashArea(margin * 2, list_y, sys_width - (margin * 4), row_h);
             current_server_index = i; 
+            AuthPendingClear(&pending_auth_action);
             strncpy(current_host, servers[i].url, MAX_STR_LEN - 1);
             current_state = STATE_SERVER_OPTIONS; Repaint(); return; 
         } 
@@ -835,6 +1004,7 @@ void HandleMainMenuTouch(int x, int y) {
     if (y >= list_y + gap && y <= list_y + row_h + gap) {
         FlashArea(margin * 2, list_y + gap, sys_width - (margin * 4), row_h);
         memset(&temp_server, 0, sizeof(OPDSServer)); 
+        temp_server.auth_mode = AUTH_MODE_NONE;
         temp_server.fetch_thumbs = 1; 
         temp_server.catalog_rows = 10;
         editing_server_index = -1;
@@ -861,8 +1031,9 @@ void DrawServerOptions() {
     int top_y = sys_height / 5;
     DrawButton(bx, top_y, bw, row_h, "Browse Catalog", 0);
     DrawButton(bx, top_y + row_h + gap, bw, row_h, "Edit Details", 0);
+    DrawButton(bx, top_y + (row_h + gap) * 2, bw, row_h, "Authentication", 0);
 
-    int mid_y = sys_height / 2;
+    int mid_y = top_y + (row_h + gap) * 4;
     DrawButton(bx, mid_y, bw, row_h, "Delete Server", 2);
 
     DrawButton(m, sys_height - 110, sys_width - (m * 2), 90, "Main Menu", 1);
@@ -872,7 +1043,7 @@ void HandleServerOptionsTouch(int x, int y) {
     int gap = sys_height / 40;
     int row_h = sys_height / 12;
     int top_y = sys_height / 5;
-    int mid_y = sys_height / 2;
+    int mid_y = top_y + (row_h + gap) * 4;
     int bw = sys_width - (sys_width / 4);
     int bx = sys_width / 8;
     int m = sys_width / 20;
@@ -887,10 +1058,46 @@ void HandleServerOptionsTouch(int x, int y) {
         editing_server_index = current_server_index; memcpy(&temp_server, &servers[current_server_index], sizeof(OPDSServer));
         current_state = STATE_SERVER_FORM; Repaint(); return;
     }
+    if (y >= top_y + (row_h + gap) * 2 &&
+        y <= top_y + (row_h + gap) * 2 + row_h) {
+        FlashArea(bx, top_y + (row_h + gap) * 2, bw, row_h);
+        current_state = STATE_AUTH_SETTINGS;
+        Repaint();
+        return;
+    }
     if (y >= mid_y && y <= mid_y + row_h) {
         FlashArea(bx, mid_y, bw, row_h);
-        for (int i = current_server_index; i < server_count - 1; i++) servers[i] = servers[i + 1];
-        server_count--; SaveServers(); current_state = STATE_MAIN_MENU; Repaint(); return;
+        int previous_count = server_count;
+        OPDSServer previous_servers[MAX_SERVERS];
+        memcpy(previous_servers, servers, sizeof(previous_servers));
+        AuthPendingClear(&pending_auth_action);
+        for (int i = current_server_index; i < server_count - 1; i++) {
+            servers[i] = servers[i + 1];
+        }
+        server_count--;
+        if (SaveServers() != 0) {
+            memcpy(servers, previous_servers, sizeof(previous_servers));
+            server_count = previous_count;
+            Message(ICON_ERROR, "Delete Failed", "Unable to save the server list.", 3000);
+            Repaint();
+            return;
+        }
+        if (AuthShiftCookieJarsAfterDelete(current_server_index, previous_count) != 0) {
+            memcpy(servers, previous_servers, sizeof(previous_servers));
+            server_count = previous_count;
+            if (SaveServers() != 0) {
+                Message(ICON_ERROR, "Delete Failed",
+                        "Session cleanup and server-list rollback both failed.", 4500);
+            } else {
+                Message(ICON_ERROR, "Delete Failed",
+                        "Unable to reindex saved sessions. The server was restored.", 4000);
+            }
+            Repaint();
+            return;
+        }
+        current_state = STATE_MAIN_MENU;
+        Repaint();
+        return;
     }
     if (y >= sys_height - 110 && y <= sys_height - 20) {
         FlashArea(m, sys_height - 110, sys_width - (m * 2), 90);
@@ -943,7 +1150,7 @@ void HandleServerFormTouch(int x, int y) {
     if (y >= ly && y <= ly + row_h) { FlashArea(box_x, ly, box_w, row_h); OpenKeyboard("Name", temp_server.name, MAX_STR_LEN - 1, 0, KbdCallback); return; } ly += row_h + gap;
     if (y >= ly && y <= ly + row_h) { FlashArea(box_x, ly, box_w, row_h); OpenKeyboard("URL", temp_server.url, MAX_STR_LEN - 1, 0, KbdCallback); return; } ly += row_h + gap;
     if (y >= ly && y <= ly + row_h) { FlashArea(box_x, ly, box_w, row_h); OpenKeyboard("User", temp_server.user, MAX_STR_LEN - 1, 0, KbdCallback); return; } ly += row_h + gap;
-    if (y >= ly && y <= ly + row_h) { FlashArea(box_x, ly, box_w, row_h); OpenKeyboard("Pass", temp_server.pass, MAX_STR_LEN - 1, 0, KbdCallback); return; } ly += row_h + gap;
+    if (y >= ly && y <= ly + row_h) { FlashArea(box_x, ly, box_w, row_h); OpenKeyboard("Pass", temp_server.pass, MAX_STR_LEN - 1, KBD_PASSWORD, KbdCallback); return; } ly += row_h + gap;
     
     if (y >= ly && y <= ly + row_h) { FlashArea(box_x, ly + (row_h / 2) - 20, 40, 40); temp_server.fetch_thumbs = !temp_server.fetch_thumbs; Repaint(); return; } ly += row_h + gap;
     
@@ -966,12 +1173,156 @@ void HandleServerFormTouch(int x, int y) {
         } else {
             FlashArea(sys_width / 2 + 20, ly, (sys_width / 2) - 40, row_h);
             if (strlen(temp_server.name) > 0) {
-                if (editing_server_index >= 0) servers[editing_server_index] = temp_server;
-                else if (server_count < MAX_SERVERS) servers[server_count++] = temp_server;
-                SaveServers();
+                OPDSServer previous_servers[MAX_SERVERS];
+                int previous_count = server_count;
+                int origin_changed = 0;
+                memcpy(previous_servers, servers, sizeof(previous_servers));
+                NormalizeServerSettings(&temp_server, 1);
+                if (editing_server_index >= 0) {
+                    origin_changed = !URLsHaveSameOrigin(servers[editing_server_index].url,
+                                                         temp_server.url);
+                    servers[editing_server_index] = temp_server;
+                } else if (server_count < MAX_SERVERS) {
+                    servers[server_count++] = temp_server;
+                } else {
+                    Message(ICON_ERROR, "Server Limit", "The maximum number of servers is configured.", 3000);
+                    Repaint();
+                    return;
+                }
+
+                if (SaveServers() != 0) {
+                    memcpy(servers, previous_servers, sizeof(previous_servers));
+                    server_count = previous_count;
+                    Message(ICON_ERROR, "Save Failed", "Unable to save server settings.", 3000);
+                    Repaint();
+                    return;
+                }
+                if (origin_changed && AuthDeleteCookieJar(editing_server_index) != 0) {
+                    Message(ICON_ERROR, "Session Cleanup Failed",
+                            "The server was saved, but its old session could not be removed.", 3500);
+                }
             }
         }
         current_state = STATE_MAIN_MENU; Repaint();
+    }
+}
+
+void DrawAuthSettings() {
+    OPDSServer *server = &servers[current_server_index];
+    int margin = sys_width / 10;
+    int width = sys_width - margin * 2;
+    int row_h = sys_height / 12;
+    int gap = sys_height / 40;
+    int y = sys_height / 8;
+    char text[MAX_STR_LEN + 64];
+
+    SetTextFont(48, 0x000000);
+    DrawTextRect(0, gap, sys_width, 60, "Authentication", ALIGN_CENTER);
+
+    snprintf(text, sizeof(text), "Mode: %s", AuthModeLabel((AuthMode)server->auth_mode));
+    DrawButton(margin, y, width, row_h, text, 0);
+    y += row_h + gap;
+
+    if (server->auth_mode == AUTH_MODE_AUTHELIA_COOKIE) {
+        DrawRect(margin, y, width, row_h, 0x000000);
+        SetTextFont(28, 0x000000);
+        DrawTextRect(margin + 15, y + 10, width - 30, row_h - 20,
+                     server->auth_url[0] ? server->auth_url : "Tap to set Authelia URL",
+                     ALIGN_LEFT);
+        y += row_h + gap;
+
+        snprintf(text, sizeof(text), "Session: %s",
+                 AuthCookieJarExists(current_server_index) ? "Saved" : "Not logged in");
+        SetTextFont(30, 0x000000);
+        DrawTextRect(margin, y, width, 50, text, ALIGN_CENTER);
+        y += 65;
+
+        DrawButton(margin, y, width, row_h, "Log In / Refresh", 0);
+        y += row_h + gap;
+        DrawButton(margin, y, width, row_h, "Log Out", 2);
+    } else if (server->auth_mode == AUTH_MODE_BASIC) {
+        SetTextFont(30, 0x000000);
+        DrawTextRect(margin, y, width, row_h * 2,
+                     "HTTP Basic uses the User and Pass fields in Edit Details.",
+                     ALIGN_CENTER);
+    } else {
+        SetTextFont(30, 0x000000);
+        DrawTextRect(margin, y, width, row_h * 2,
+                     "No authentication credentials will be sent.",
+                     ALIGN_CENTER);
+    }
+
+    DrawButton(margin, sys_height - 110, width, 90, "Back", 1);
+}
+
+void HandleAuthSettingsTouch(int x, int y) {
+    (void)x;
+    OPDSServer *server = &servers[current_server_index];
+    int margin = sys_width / 10;
+    int width = sys_width - margin * 2;
+    int row_h = sys_height / 12;
+    int gap = sys_height / 40;
+    int top = sys_height / 8;
+
+    if (y >= top && y <= top + row_h) {
+        OPDSServer previous_server = *server;
+        AuthMode previous = (AuthMode)server->auth_mode;
+        server->auth_mode = NextAuthMode(previous);
+        AuthPendingClear(&pending_auth_action);
+        if (server->auth_mode == AUTH_MODE_AUTHELIA_COOKIE) {
+            SecureZero(server->user, sizeof(server->user));
+            SecureZero(server->pass, sizeof(server->pass));
+        }
+        if (SaveServers() != 0) {
+            *server = previous_server;
+            Message(ICON_ERROR, "Save Failed", "Unable to save authentication settings.", 3000);
+        } else if (previous == AUTH_MODE_AUTHELIA_COOKIE &&
+                   server->auth_mode != AUTH_MODE_AUTHELIA_COOKIE &&
+                   AuthDeleteCookieJar(current_server_index) != 0) {
+            Message(ICON_ERROR, "Session Cleanup Failed",
+                    "The mode was saved, but the old session could not be removed.", 3500);
+        }
+        FlashArea(margin, top, width, row_h);
+        Repaint();
+        return;
+    }
+
+    if (server->auth_mode == AUTH_MODE_AUTHELIA_COOKIE) {
+        int auth_url_y = top + row_h + gap;
+        int status_y = auth_url_y + row_h + gap;
+        int login_y = status_y + 65;
+        int logout_y = login_y + row_h + gap;
+
+        if (y >= auth_url_y && y <= auth_url_y + row_h) {
+            FlashArea(margin, auth_url_y, width, row_h);
+            strncpy(auth_url_backup, server->auth_url, sizeof(auth_url_backup) - 1);
+            auth_url_backup[sizeof(auth_url_backup) - 1] = '\0';
+            OpenKeyboard("Authelia URL", server->auth_url, MAX_STR_LEN - 1,
+                         KBD_URL, AuthURLCallback);
+            return;
+        }
+        if (y >= login_y && y <= login_y + row_h) {
+            FlashArea(margin, login_y, width, row_h);
+            StartAutheliaLogin();
+            return;
+        }
+        if (y >= logout_y && y <= logout_y + row_h) {
+            FlashArea(margin, logout_y, width, row_h);
+            AutheliaResult result = AutheliaLogout(server, current_server_index);
+            AuthPendingClear(&pending_auth_action);
+            Message(result == AUTHELIA_OK ? ICON_INFORMATION : ICON_ERROR,
+                    "Authelia Logout", result == AUTHELIA_OK ? "Session cleared." :
+                    AutheliaResultMessage(result), 3000);
+            Repaint();
+            return;
+        }
+    }
+
+    if (y >= sys_height - 110) {
+        FlashArea(margin, sys_height - 110, width, 90);
+        CancelAuthUI();
+        current_state = STATE_SERVER_OPTIONS;
+        Repaint();
     }
 }
 
@@ -1233,7 +1584,10 @@ void HandleBrowsingTouch(int x, int y) {
                     char c_path[MAX_STR_LEN]; snprintf(c_path, sizeof(c_path), "%scache_%lu.jpg", IMAGES_DIR, hash_str(e->cover_url));
                     if (EnsureNetwork() == 0) {
                         struct stat st; 
-                        if (stat(c_path, &st) == 0 || DownloadImage(e->cover_url, c_path, servers[current_server_index].user, servers[current_server_index].pass) == 0) {
+                        if (stat(c_path, &st) == 0 ||
+                            DownloadImage(e->cover_url, c_path,
+                                          &servers[current_server_index],
+                                          current_server_index) == NETWORK_OK) {
                             current_cover_bmp = LoadCoverSTB(c_path);
                         }
                     }
@@ -1272,28 +1626,68 @@ void DrawBookDetails() {
     SoftUpdate();
 }
 
+static void DownloadSelectedFormat(int format_index) {
+    OPDSEntry *e = &current_entries[selected_entry_index];
+    if (format_index < 0 || format_index >= e->format_count) return;
+    if (EnsureNetwork() != 0) {
+        Repaint();
+        return;
+    }
+
+    char tmp_fname[MAX_STR_LEN];
+    char server_fname[256] = {0};
+    char tmp_path[MAX_STR_LEN];
+    snprintf(tmp_fname, sizeof(tmp_fname), "dl_%ld.tmp", (long)time(NULL));
+    snprintf(tmp_path, sizeof(tmp_path), "%s%s", BOOKS_DIR, tmp_fname);
+    Repaint();
+
+    NetworkResult result = DownloadBook(e->formats[format_index].url, tmp_path, server_fname,
+                                        &servers[current_server_index],
+                                        current_server_index);
+    if (result == NETWORK_OK) {
+        if (strlen(server_fname) == 0) {
+            snprintf(server_fname, sizeof(server_fname), "%s.%s",
+                     e->title, e->formats[format_index].label);
+        }
+        for (size_t j = 0; server_fname[j]; j++) {
+            if (server_fname[j] == '/' || server_fname[j] == '\\' || server_fname[j] == ':') {
+                server_fname[j] = '-';
+            }
+        }
+        char final_path[MAX_STR_LEN];
+        snprintf(final_path, sizeof(final_path), "%s%s", BOOKS_DIR, server_fname);
+        if (rename(tmp_path, final_path) == 0) {
+            TriggerLibraryRefresh();
+            Message(ICON_INFORMATION, "Success", "Book saved to library.", 2000);
+        } else {
+            remove(tmp_path);
+            Message(ICON_ERROR, "Failed", "Unable to save the downloaded book.", 3000);
+        }
+    } else if (result == NETWORK_AUTH_REQUIRED) {
+        remove(tmp_path);
+        AuthPendingSetBook(&pending_auth_action, format_index);
+        Message(ICON_ERROR, "Authentication Required",
+                "The Authelia session expired. Log in to resume the download.", 3500);
+        current_state = STATE_AUTH_SETTINGS;
+    } else if (result == NETWORK_TLS_ERROR) {
+        remove(tmp_path);
+        Message(ICON_ERROR, "TLS Error", "The server certificate could not be verified.", 3500);
+    } else {
+        remove(tmp_path);
+        Message(ICON_ERROR, "Failed", "Download error.", 3000);
+    }
+    Repaint();
+}
+
 void HandleBookDetailsTouch(int x, int y) {
     OPDSEntry *e = &current_entries[selected_entry_index];
-    int m = sys_width / 20, thumb_w = sys_width / 3, by = m + 180 + (int)(thumb_w * 1.4) + 40; 
+    int m = sys_width / 20, thumb_w = sys_width / 3, by = m + 180 + (int)(thumb_w * 1.4) + 40;
 
     for (int i = 0; i < e->format_count; i++) {
         if (y >= by && y <= by + 90) {
             FlashArea(m, by, sys_width - (m * 2), 90);
-            if (EnsureNetwork() != 0) { Repaint(); return; }
-
-            char tmp_fname[MAX_STR_LEN], server_fname[256] = {0}; 
-            snprintf(tmp_fname, sizeof(tmp_fname), "dl_%ld.tmp", (long)time(NULL));
-            char tmp_path[MAX_STR_LEN]; snprintf(tmp_path, sizeof(tmp_path), "%s%s", BOOKS_DIR, tmp_fname);
-            Repaint(); 
-            
-            int res = DownloadBook(e->formats[i].url, tmp_path, server_fname, servers[current_server_index].user, servers[current_server_index].pass);
-            if (res == 0) { 
-                if (strlen(server_fname) == 0) snprintf(server_fname, sizeof(server_fname), "%s.%s", e->title, e->formats[i].label);
-                for(size_t j=0; server_fname[j]; j++) { if(server_fname[j] == '/' || server_fname[j] == '\\' || server_fname[j] == ':') server_fname[j] = '-'; }
-                char final_path[MAX_STR_LEN]; snprintf(final_path, sizeof(final_path), "%s%s", BOOKS_DIR, server_fname);
-                rename(tmp_path, final_path); TriggerLibraryRefresh(); Message(ICON_INFORMATION, "Success", "Book saved to library.", 2000); 
-            } else { remove(tmp_path); Message(ICON_ERROR, "Failed", "Download error.", 3000); }
-            Repaint(); return;
+            DownloadSelectedFormat(i);
+            return;
         } by += 110;
     }
     if (y >= sys_height - 110) { 

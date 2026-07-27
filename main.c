@@ -85,13 +85,14 @@ void Repaint() {
         case STATE_MAIN_MENU:      DrawMainMenu(); break;
         case STATE_SERVER_OPTIONS: DrawServerOptions(); break;
         case STATE_SERVER_FORM:    DrawServerForm(); break;
+        case STATE_AUTH_SETTINGS:  DrawAuthSettings(); break;
         case STATE_BROWSING:       DrawBrowsingView(); break;
         case STATE_BOOK_DETAILS:   DrawBookDetails(); break;
     }
     FullUpdate();
 }
 
-void SaveServers() {
+int SaveServers() {
     // Ensure the application directory exists before attempting to save!
     mkdir(APP_ROOT_DIR, 0777);
 
@@ -103,7 +104,7 @@ void SaveServers() {
     iconfig *cfg = OpenConfig(NEW_CFG_FILE, NULL);
     if (!cfg) {
         LogDebug("Failed to open config for saving.");
-        return;
+        return -1;
     }
 
     WriteInt(cfg, "server_count", server_count);
@@ -122,6 +123,12 @@ void SaveServers() {
         
         snprintf(key, sizeof(key), "server_%d_pass", i); 
         WriteString(cfg, key, servers[i].pass);
+
+        snprintf(key, sizeof(key), "server_%d_auth_mode", i);
+        WriteInt(cfg, key, servers[i].auth_mode);
+
+        snprintf(key, sizeof(key), "server_%d_auth_url", i);
+        WriteString(cfg, key, servers[i].auth_url);
         
         snprintf(key, sizeof(key), "server_%d_fetch_thumbs", i); 
         WriteInt(cfg, key, servers[i].fetch_thumbs);
@@ -130,13 +137,19 @@ void SaveServers() {
         WriteInt(cfg, key, servers[i].catalog_rows);
     }
     
-    SaveConfig(cfg);
+    int save_result = SaveConfig(cfg);
     CloseConfig(cfg);
+    if (save_result != 0 || chmod(NEW_CFG_FILE, 0600) != 0) {
+        LogDebug("Failed to save config or restrict its permissions.");
+        return -1;
+    }
+    return 0;
 }
 
 void LoadServers() {
     // Ensure the app directory is available immediately on boot
     mkdir(APP_ROOT_DIR, 0777);
+    mkdir(AUTH_DIR, 0700);
 
     // --- NORMAL TEXT LOAD FROM NEW LOCATION ---
     // Explicitly check if the file exists on the filesystem first.
@@ -160,17 +173,26 @@ void LoadServers() {
                 
                 snprintf(key, sizeof(key), "server_%d_pass", i);
                 strncpy(servers[i].pass, ReadString(cfg, key, ""), MAX_STR_LEN - 1);
+
+                snprintf(key, sizeof(key), "server_%d_auth_mode", i);
+                int saved_auth_mode = ReadInt(cfg, key, -1);
+                servers[i].auth_mode = saved_auth_mode;
+
+                snprintf(key, sizeof(key), "server_%d_auth_url", i);
+                strncpy(servers[i].auth_url, ReadString(cfg, key, ""), MAX_STR_LEN - 1);
                 
                 snprintf(key, sizeof(key), "server_%d_fetch_thumbs", i);
                 servers[i].fetch_thumbs = ReadInt(cfg, key, 1); 
                 
                 snprintf(key, sizeof(key), "server_%d_catalog_rows", i);
                 servers[i].catalog_rows = ReadInt(cfg, key, 10); 
-                if (servers[i].catalog_rows < 4) servers[i].catalog_rows = 4;
-                if (servers[i].catalog_rows > 10) servers[i].catalog_rows = 10;
+                NormalizeServerSettings(&servers[i], saved_auth_mode != -1);
             }
 
             CloseConfig(cfg);
+            if (chmod(NEW_CFG_FILE, 0600) != 0) {
+                LogDebug("Failed to restrict config file permissions.");
+            }
         }
         return; // Successfully loaded from new location
     }
@@ -195,8 +217,11 @@ void LoadServers() {
                         strncpy(servers[i].url, old_servers[i].url, MAX_STR_LEN);
                         strncpy(servers[i].user, old_servers[i].user, MAX_STR_LEN);
                         strncpy(servers[i].pass, old_servers[i].pass, MAX_STR_LEN);
+                        servers[i].auth_mode = old_servers[i].user[0] ? AUTH_MODE_BASIC : AUTH_MODE_NONE;
+                        servers[i].auth_url[0] = '\0';
                         servers[i].fetch_thumbs = old_servers[i].fetch_thumbs;
                         servers[i].catalog_rows = 10; // Default new property
+                        NormalizeServerSettings(&servers[i], 1);
                     }
                 }
                 fclose(fp);
@@ -217,12 +242,13 @@ void LoadServers() {
                         strncpy(servers[i].user, ReadString(old_cfg, key, ""), MAX_STR_LEN - 1);
                         snprintf(key, sizeof(key), "server_%d_pass", i);
                         strncpy(servers[i].pass, ReadString(old_cfg, key, ""), MAX_STR_LEN - 1);
+                        servers[i].auth_url[0] = '\0';
+                        servers[i].auth_mode = servers[i].user[0] ? AUTH_MODE_BASIC : AUTH_MODE_NONE;
                         snprintf(key, sizeof(key), "server_%d_fetch_thumbs", i);
                         servers[i].fetch_thumbs = ReadInt(old_cfg, key, 1); 
                         snprintf(key, sizeof(key), "server_%d_catalog_rows", i);
                         servers[i].catalog_rows = ReadInt(old_cfg, key, 10); 
-                        if (servers[i].catalog_rows < 4) servers[i].catalog_rows = 4;
-                        if (servers[i].catalog_rows > 10) servers[i].catalog_rows = 10;
+                        NormalizeServerSettings(&servers[i], 1);
                     }
                     CloseConfig(old_cfg);
                 }
@@ -234,7 +260,9 @@ void LoadServers() {
             rename(LEGACY_CFG_FILE, bak_file); 
             
             // Save immediately in the new robust text format at the NEW location
-            SaveServers(); 
+            if (SaveServers() != 0) {
+                LogDebug("Failed to save migrated server configuration.");
+            }
         }
     } else {
         server_count = 0;
@@ -248,6 +276,7 @@ static int main_handler(int event, int a, int b) {
             sys_width = ScreenWidth();
             sys_height = ScreenHeight();
             LoadServers();
+            InitNetwork();
             LogDebug("--- App Started ---");
 
             // --- Dynamic Loading for Dark Mode (FW 6.8+) ---
@@ -288,6 +317,11 @@ static int main_handler(int event, int a, int b) {
         case EVT_KEYPRESS:
             if (a == IV_KEY_BACK) { 
                 if (current_state == STATE_MAIN_MENU) CloseApp();
+                else if (current_state == STATE_AUTH_SETTINGS) {
+                    CancelAuthUI();
+                    current_state = STATE_SERVER_OPTIONS;
+                    Repaint();
+                }
                 else {
                     current_state = STATE_MAIN_MENU;
                     Repaint();
@@ -302,12 +336,15 @@ static int main_handler(int event, int a, int b) {
                 case STATE_MAIN_MENU:      HandleMainMenuTouch(a, b); break;
                 case STATE_SERVER_OPTIONS: HandleServerOptionsTouch(a, b); break;
                 case STATE_SERVER_FORM:    HandleServerFormTouch(a, b); break;
+                case STATE_AUTH_SETTINGS:  HandleAuthSettingsTouch(a, b); break;
                 case STATE_BROWSING:       HandleBrowsingTouch(a, b); break;
                 case STATE_BOOK_DETAILS:   HandleBookDetailsTouch(a, b); break;
             }
             break;
 
         case EVT_EXIT:
+            CancelAuthUI();
+            CleanupNetwork();
             break;
     }
     return 0;

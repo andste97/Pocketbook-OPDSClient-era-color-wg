@@ -1,33 +1,57 @@
 #include "opds_app.h"
 #include <curl/curl.h>
+#include <ctype.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+#include <unistd.h>
+
+#define DEVICE_CA_BUNDLE "/ebrmain/share/ssl/certs/ca-certificates.crt"
 
 extern void LogDebug(const char *msg);
 extern void ShowDownloadProgress(long long total, long long current);
-extern int CheckDownloadCancel();
-extern char current_host[MAX_STR_LEN]; // Populated by ui.c
+extern int CheckDownloadCancel(void);
+extern char current_host[MAX_STR_LEN];
 
-// RELATIVE URL SAFETY NET
+static int network_initialized;
+
+void InitNetwork(void) {
+    if (!network_initialized && curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK) {
+        network_initialized = 1;
+    }
+}
+
+void CleanupNetwork(void) {
+    if (network_initialized) {
+        curl_global_cleanup();
+        network_initialized = 0;
+    }
+}
+
 void EnsureAbsoluteURL(const char *in_url, char *out_url) {
     if (strncmp(in_url, "http://", 7) == 0 || strncmp(in_url, "https://", 8) == 0) {
         strncpy(out_url, in_url, MAX_STR_LEN * 2 - 1);
+        out_url[MAX_STR_LEN * 2 - 1] = '\0';
         return;
     }
-    
+
     char base_domain[256] = {0};
     const char *proto_end = strstr(current_host, "://");
     if (proto_end) {
         const char *path_start = strchr(proto_end + 3, '/');
         if (path_start) {
-            strncpy(base_domain, current_host, path_start - current_host);
+            size_t length = (size_t)(path_start - current_host);
+            if (length >= sizeof(base_domain)) length = sizeof(base_domain) - 1;
+            memcpy(base_domain, current_host, length);
+            base_domain[length] = '\0';
         } else {
-            strncpy(base_domain, current_host, 255);
+            strncpy(base_domain, current_host, sizeof(base_domain) - 1);
         }
     } else {
-        strncpy(base_domain, current_host, 255);
+        strncpy(base_domain, current_host, sizeof(base_domain) - 1);
     }
-    
+
     if (in_url[0] == '/') {
         snprintf(out_url, MAX_STR_LEN * 2, "%s%s", base_domain, in_url);
     } else {
@@ -35,234 +59,429 @@ void EnsureAbsoluteURL(const char *in_url, char *out_url) {
     }
 }
 
-// Memory write callback for catalog XML
 static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp) {
-    size_t realsize = size * nmemb;
-    struct MemoryStruct *mem = (struct MemoryStruct *)userp;
+    size_t real_size = size * nmemb;
+    struct MemoryStruct *memory = (struct MemoryStruct *)userp;
+    char *updated = realloc(memory->memory, memory->size + real_size + 1);
+    if (!updated) return 0;
 
-    char *ptr = realloc(mem->memory, mem->size + realsize + 1);
-    if(!ptr) return 0; 
-    
-    mem->memory = ptr;
-    memcpy(&(mem->memory[mem->size]), contents, realsize);
-    mem->size += realsize;
-    mem->memory[mem->size] = 0;
-    
-    return realsize;
+    memory->memory = updated;
+    memcpy(memory->memory + memory->size, contents, real_size);
+    memory->size += real_size;
+    memory->memory[memory->size] = '\0';
+    return real_size;
 }
 
-// File write callback for downloading Books and Images
 static size_t WriteFileCallback(void *ptr, size_t size, size_t nmemb, void *stream) {
     return fwrite(ptr, size, nmemb, (FILE *)stream);
 }
 
-// Debug callback to log network headers
-static int DebugCallback(CURL *handle, curl_infotype type, char *data, size_t size, void *userptr) {
-    if (type == CURLINFO_HEADER_OUT) {
-        char buf[MAX_STR_LEN];
-        char *token = strtok(data, "\r\n");
-        while (token != NULL) {
-            snprintf(buf, sizeof(buf), ">>> SEND: %s", token);
-            LogDebug(buf);
-            token = strtok(NULL, "\r\n");
+static int HeaderNameMatches(const char *line, const char *name) {
+    size_t name_len = strlen(name);
+    return strncasecmp(line, name, name_len) == 0 && line[name_len] == ':';
+}
+
+static char *FindCaseInsensitive(char *text, const char *needle) {
+    size_t needle_len = strlen(needle);
+    if (needle_len == 0) return text;
+
+    for (char *cursor = text; *cursor; cursor++) {
+        if (strncasecmp(cursor, needle, needle_len) == 0) return cursor;
+    }
+    return NULL;
+}
+
+void RedactHTTPHeader(const char *line, char *out, size_t out_size) {
+    const char *sensitive[] = {
+        "Authorization",
+        "Proxy-Authorization",
+        "Cookie",
+        "Set-Cookie"
+    };
+
+    if (!line || !out || out_size == 0) return;
+
+    for (size_t i = 0; i < sizeof(sensitive) / sizeof(sensitive[0]); i++) {
+        if (HeaderNameMatches(line, sensitive[i])) {
+            snprintf(out, out_size, "%s: [REDACTED]", sensitive[i]);
+            return;
         }
     }
+
+    snprintf(out, out_size, "%s", line);
+}
+
+static void LogHeaderLines(const char *prefix, const char *data, size_t size) {
+    size_t offset = 0;
+
+    while (offset < size) {
+        size_t end = offset;
+        while (end < size && data[end] != '\r' && data[end] != '\n') end++;
+
+        if (end > offset) {
+            char line[512];
+            char redacted[512];
+            char message[MAX_STR_LEN + 32];
+            size_t length = end - offset;
+            if (length >= sizeof(line)) length = sizeof(line) - 1;
+            memcpy(line, data + offset, length);
+            line[length] = '\0';
+            RedactHTTPHeader(line, redacted, sizeof(redacted));
+            snprintf(message, sizeof(message), "%s%s", prefix, redacted);
+            LogDebug(message);
+        }
+
+        while (end < size && (data[end] == '\r' || data[end] == '\n')) end++;
+        offset = end;
+    }
+}
+
+static int DebugCallback(CURL *handle, curl_infotype type, char *data, size_t size, void *userptr) {
+    (void)handle;
+    (void)userptr;
+    if (type == CURLINFO_HEADER_OUT) LogHeaderLines(">>> SEND: ", data, size);
+    if (type == CURLINFO_HEADER_IN) LogHeaderLines("<<< RECV: ", data, size);
     return 0;
 }
 
-// Progress callback to update the UI
-static int ProgressCallback(void *clientp, double dltotal, double dlnow, double ultotal, double ulnow) {
+static int ProgressCallback(void *clientp, curl_off_t dltotal, curl_off_t dlnow,
+                            curl_off_t ultotal, curl_off_t ulnow) {
+    (void)clientp;
+    (void)ultotal;
+    (void)ulnow;
     if (dltotal > 0) {
         ShowDownloadProgress((long long)dltotal, (long long)dlnow);
     }
     return CheckDownloadCancel();
 }
 
-// QUOTE-AWARE HEADER PARSER
 static size_t HeaderCallback(char *buffer, size_t size, size_t nitems, void *userdata) {
-    size_t numbytes = size * nitems;
+    size_t num_bytes = size * nitems;
     char *filename = (char *)userdata;
-    
-    char log_buf[MAX_STR_LEN];
-    char clean_buf[512] = {0};
-    size_t copy_len = numbytes < 511 ? numbytes : 511;
-    strncpy(clean_buf, buffer, copy_len);
-    
-    while(copy_len > 0 && (clean_buf[copy_len-1] == '\n' || clean_buf[copy_len-1] == '\r')) {
-        clean_buf[copy_len-1] = '\0'; copy_len--;
-    }
-    
-    if (copy_len > 0) {
-        snprintf(log_buf, sizeof(log_buf), "<<< RECV: %s", clean_buf);
-        LogDebug(log_buf);
-    }
+    LogHeaderLines("<<< RECV: ", buffer, num_bytes);
 
-    if (filename && strncasecmp(buffer, "Content-Disposition:", 20) == 0) {
-        char *ptr = strstr(buffer, "filename=");
+    if (filename && num_bytes > 20 && strncasecmp(buffer, "Content-Disposition:", 20) == 0) {
+        char line[512];
+        size_t length = num_bytes < sizeof(line) - 1 ? num_bytes : sizeof(line) - 1;
+        memcpy(line, buffer, length);
+        line[length] = '\0';
+
+        char *ptr = FindCaseInsensitive(line, "filename=");
         if (ptr) {
-            ptr += 9; 
+            ptr += 9;
             if (*ptr == '"') {
-                ptr++; 
-                char *end = strchr(ptr, '"');
+                char *end;
+                ptr++;
+                end = strchr(ptr, '"');
                 if (end) {
-                    int len = end - ptr;
-                    if (len > 255) len = 255;
-                    strncpy(filename, ptr, len);
-                    filename[len] = '\0';
+                    size_t filename_len = (size_t)(end - ptr);
+                    if (filename_len > 255) filename_len = 255;
+                    memcpy(filename, ptr, filename_len);
+                    filename[filename_len] = '\0';
                 }
-            } 
-            else {
-                int i = 0;
-                while (ptr[i] && ptr[i] != ' ' && ptr[i] != ';' && ptr[i] != '\r' && ptr[i] != '\n' && i < 255) {
-                    filename[i] = ptr[i]; 
+            } else {
+                size_t i = 0;
+                while (ptr[i] && ptr[i] != ' ' && ptr[i] != ';' &&
+                       ptr[i] != '\r' && ptr[i] != '\n' && i < 255) {
+                    filename[i] = ptr[i];
                     i++;
                 }
                 filename[i] = '\0';
             }
         }
     }
-    return numbytes;
+
+    return num_bytes;
 }
 
-int FetchFeed(const char *url, const char *user, const char *pass, struct MemoryStruct *chunk) {
+int URLsHaveSameOrigin(const char *left, const char *right) {
+    CURLU *left_url = NULL;
+    CURLU *right_url = NULL;
+    char *left_scheme = NULL;
+    char *right_scheme = NULL;
+    char *left_host = NULL;
+    char *right_host = NULL;
+    char *left_port = NULL;
+    char *right_port = NULL;
+    int matches = 0;
+
+    if (!left || !right) return 0;
+    left_url = curl_url();
+    right_url = curl_url();
+    if (!left_url || !right_url ||
+        curl_url_set(left_url, CURLUPART_URL, left, 0) != CURLUE_OK ||
+        curl_url_set(right_url, CURLUPART_URL, right, 0) != CURLUE_OK ||
+        curl_url_get(left_url, CURLUPART_SCHEME, &left_scheme, 0) != CURLUE_OK ||
+        curl_url_get(right_url, CURLUPART_SCHEME, &right_scheme, 0) != CURLUE_OK ||
+        curl_url_get(left_url, CURLUPART_HOST, &left_host, 0) != CURLUE_OK ||
+        curl_url_get(right_url, CURLUPART_HOST, &right_host, 0) != CURLUE_OK) {
+        goto cleanup;
+    }
+
+    if (curl_url_get(left_url, CURLUPART_PORT, &left_port, 0) != CURLUE_OK) {
+        left_port = NULL;
+    }
+    if (curl_url_get(right_url, CURLUPART_PORT, &right_port, 0) != CURLUE_OK) {
+        right_port = NULL;
+    }
+
+    const char *left_effective_port = left_port ? left_port :
+        (strcasecmp(left_scheme, "https") == 0 ? "443" :
+         strcasecmp(left_scheme, "http") == 0 ? "80" : "");
+    const char *right_effective_port = right_port ? right_port :
+        (strcasecmp(right_scheme, "https") == 0 ? "443" :
+         strcasecmp(right_scheme, "http") == 0 ? "80" : "");
+
+    matches = strcasecmp(left_scheme, right_scheme) == 0 &&
+              strcasecmp(left_host, right_host) == 0 &&
+              strcmp(left_effective_port, right_effective_port) == 0;
+
+cleanup:
+    if (left_scheme) curl_free(left_scheme);
+    if (right_scheme) curl_free(right_scheme);
+    if (left_host) curl_free(left_host);
+    if (right_host) curl_free(right_host);
+    if (left_port) curl_free(left_port);
+    if (right_port) curl_free(right_port);
+    if (left_url) curl_url_cleanup(left_url);
+    if (right_url) curl_url_cleanup(right_url);
+    return matches;
+}
+
+static int IsTLSError(CURLcode code) {
+    return code == CURLE_PEER_FAILED_VERIFICATION ||
+           code == CURLE_SSL_CONNECT_ERROR ||
+           code == CURLE_SSL_CERTPROBLEM ||
+           code == CURLE_SSL_CIPHER ||
+           code == CURLE_SSL_CACERT_BADFILE;
+}
+
+int RequestUsesServerCredentials(const OPDSServer *server, const char *url) {
+    return server && url && server->url[0] && URLsHaveSameOrigin(server->url, url);
+}
+
+NetworkResult ClassifyNetworkResponse(int curl_code, long http_code,
+                                      const char *requested_url, const char *effective_url,
+                                      const OPDSServer *server) {
+    if (curl_code != CURLE_OK) {
+        return IsTLSError(curl_code) ? NETWORK_TLS_ERROR : NETWORK_ERROR;
+    }
+
+    if (server && server->auth_mode == AUTH_MODE_AUTHELIA_COOKIE) {
+        int protected_origin = RequestUsesServerCredentials(server, requested_url);
+        if (http_code == 401 && protected_origin) return NETWORK_AUTH_REQUIRED;
+        if (effective_url && server->auth_url[0] &&
+            protected_origin &&
+            URLsHaveSameOrigin(effective_url, server->auth_url) &&
+            !URLsHaveSameOrigin(requested_url, server->auth_url)) {
+            return NETWORK_AUTH_REQUIRED;
+        }
+    }
+
+    if (http_code < 200 || http_code >= 300) return NETWORK_HTTP_ERROR;
+    return NETWORK_OK;
+}
+
+static int ConfigureAuthentication(CURL *curl, const char *url,
+                                   const OPDSServer *server, int server_index,
+                                   char *cookie_path, size_t cookie_path_size) {
+    if (!server || server->auth_mode == AUTH_MODE_NONE) return 0;
+
+    if (server->auth_mode == AUTH_MODE_BASIC) {
+        if (server->user[0] && RequestUsesServerCredentials(server, url)) {
+            curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
+            curl_easy_setopt(curl, CURLOPT_USERNAME, server->user);
+            curl_easy_setopt(curl, CURLOPT_PASSWORD, server->pass);
+        }
+        return 0;
+    }
+
+    if (server->auth_mode == AUTH_MODE_AUTHELIA_COOKIE) {
+        if (!RequestUsesServerCredentials(server, url)) return 0;
+        if (AuthGetCookieJarPath(server_index, cookie_path, cookie_path_size) != 0) return -1;
+        curl_easy_setopt(curl, CURLOPT_COOKIEFILE, cookie_path);
+        curl_easy_setopt(curl, CURLOPT_COOKIEJAR, cookie_path);
+        return 0;
+    }
+
+    return -1;
+}
+
+static int ConfigureCommonRequest(CURL *curl, const char *url, const OPDSServer *server,
+                                  int server_index, char *cookie_path, size_t cookie_path_size) {
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, APP_USER_AGENT);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 30L);
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION,
+                     server && server->auth_mode == AUTH_MODE_AUTHELIA_COOKIE ? 0L : 1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+    if (access(DEVICE_CA_BUNDLE, R_OK) == 0) {
+        curl_easy_setopt(curl, CURLOPT_CAINFO, DEVICE_CA_BUNDLE);
+    }
+    curl_easy_setopt(curl, CURLOPT_DEBUGFUNCTION, DebugCallback);
+    curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+
+    return ConfigureAuthentication(curl, url, server, server_index,
+                                   cookie_path, cookie_path_size);
+}
+
+static NetworkResult FinishRequest(CURL *curl, CURLcode code, const char *requested_url,
+                                   const OPDSServer *server, const char *cookie_path) {
+    long http_code = 0;
+    char *effective_url = NULL;
+    char *redirect_url = NULL;
+
+    if (code == CURLE_OK) {
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+        curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &effective_url);
+        curl_easy_getinfo(curl, CURLINFO_REDIRECT_URL, &redirect_url);
+    }
+
+    const char *classification_url = redirect_url ? redirect_url : effective_url;
+    NetworkResult result = ClassifyNetworkResponse(code, http_code, requested_url,
+                                                   classification_url, server);
+    curl_easy_cleanup(curl);
+    if (cookie_path && cookie_path[0]) chmod(cookie_path, 0600);
+    return result;
+}
+
+NetworkResult FetchFeed(const char *url, const OPDSServer *server, int server_index,
+                        struct MemoryStruct *chunk) {
     CURL *curl;
-    CURLcode res;
-    
+    CURLcode code;
     char safe_url[MAX_STR_LEN * 2] = {0};
+    char cookie_path[MAX_STR_LEN * 2] = {0};
+
+    if (!url || !chunk) return NETWORK_ERROR;
     EnsureAbsoluteURL(url, safe_url);
 
     chunk->memory = malloc(1);
+    if (!chunk->memory) return NETWORK_ERROR;
+    chunk->memory[0] = '\0';
     chunk->size = 0;
 
     curl = curl_easy_init();
-    if(!curl) return -1;
-    
+    if (!curl) {
+        free(chunk->memory);
+        chunk->memory = NULL;
+        return NETWORK_ERROR;
+    }
+
     LogDebug("================ NETWORK REQUEST START ================");
-    char msg[MAX_STR_LEN]; snprintf(msg, sizeof(msg), "TARGET: [%s]", safe_url); LogDebug(msg);
+    char message[MAX_STR_LEN * 2 + 32];
+    snprintf(message, sizeof(message), "TARGET: [%s]", safe_url);
+    LogDebug(message);
 
-    // Relaxed Network Timeouts (30 seconds)
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
-    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 30L);
-    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
+    if (ConfigureCommonRequest(curl, safe_url, server, server_index, cookie_path, sizeof(cookie_path)) != 0) {
+        curl_easy_cleanup(curl);
+        free(chunk->memory);
+        chunk->memory = NULL;
+        return NETWORK_ERROR;
+    }
 
-    curl_easy_setopt(curl, CURLOPT_URL, safe_url);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)chunk);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, APP_USER_AGENT);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
-    curl_easy_setopt(curl, CURLOPT_DEBUGFUNCTION, DebugCallback);
-    curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, chunk);
     curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, HeaderCallback);
     curl_easy_setopt(curl, CURLOPT_HEADERDATA, NULL);
 
-    if (user && pass && strlen(user) > 0) {
-        curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
-        char auth[512]; snprintf(auth, sizeof(auth), "%s:%s", user, pass);
-        curl_easy_setopt(curl, CURLOPT_USERPWD, auth);
-    }
-
-    res = curl_easy_perform(curl);
-    curl_easy_cleanup(curl);
+    code = curl_easy_perform(curl);
+    NetworkResult result = FinishRequest(curl, code, safe_url, server, cookie_path);
     LogDebug("================ NETWORK REQUEST END ================");
 
-    return (res == CURLE_OK) ? 0 : -1;
+    if (result != NETWORK_OK) {
+        SecureZero(chunk->memory, chunk->size);
+        free(chunk->memory);
+        chunk->memory = NULL;
+        chunk->size = 0;
+    }
+
+    return result;
 }
 
-int DownloadBook(const char *url, const char *filepath, char *server_fname, const char *user, const char *pass) {
+NetworkResult DownloadBook(const char *url, const char *filepath, char *server_fname,
+                           const OPDSServer *server, int server_index) {
     CURL *curl;
-    CURLcode res;
-    FILE *fp;
-
+    CURLcode code;
+    FILE *file;
     char safe_url[MAX_STR_LEN * 2] = {0};
+    char cookie_path[MAX_STR_LEN * 2] = {0};
+
+    if (!url || !filepath) return NETWORK_ERROR;
     EnsureAbsoluteURL(url, safe_url);
-
-    fp = fopen(filepath, "wb");
-    if (!fp) return -1;
-
-    if (server_fname) server_fname[0] = '\0'; 
+    file = fopen(filepath, "wb");
+    if (!file) return NETWORK_ERROR;
+    if (server_fname) server_fname[0] = '\0';
 
     curl = curl_easy_init();
-    if (!curl) { fclose(fp); return -1; }
+    if (!curl) {
+        fclose(file);
+        remove(filepath);
+        return NETWORK_ERROR;
+    }
 
     LogDebug("================ DOWNLOAD REQUEST START ================");
-    char msg[MAX_STR_LEN]; snprintf(msg, sizeof(msg), "DOWNLOAD TARGET: [%s]", safe_url); LogDebug(msg);
+    if (ConfigureCommonRequest(curl, safe_url, server, server_index, cookie_path, sizeof(cookie_path)) != 0) {
+        curl_easy_cleanup(curl);
+        fclose(file);
+        remove(filepath);
+        return NETWORK_ERROR;
+    }
 
-    // Relaxed Network Timeouts (30 seconds)
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
-    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 30L);
-    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
-
-    curl_easy_setopt(curl, CURLOPT_URL, safe_url);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteFileCallback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, APP_USER_AGENT);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
-    curl_easy_setopt(curl, CURLOPT_DEBUGFUNCTION, DebugCallback);
-    curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, file);
     curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-    curl_easy_setopt(curl, CURLOPT_PROGRESSFUNCTION, ProgressCallback);
-    
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, ProgressCallback);
     if (server_fname) {
         curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, HeaderCallback);
         curl_easy_setopt(curl, CURLOPT_HEADERDATA, server_fname);
     }
 
-    if (user && pass && strlen(user) > 0) {
-        curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
-        char auth[512]; snprintf(auth, sizeof(auth), "%s:%s", user, pass);
-        curl_easy_setopt(curl, CURLOPT_USERPWD, auth);
-    }
-
-    res = curl_easy_perform(curl);
-    curl_easy_cleanup(curl);
-    fclose(fp);
+    code = curl_easy_perform(curl);
+    NetworkResult result = FinishRequest(curl, code, safe_url, server, cookie_path);
+    fclose(file);
     LogDebug("================ DOWNLOAD REQUEST END ================");
 
-    if (res != CURLE_OK) { remove(filepath); return -1; }
-    return 0;
+    if (result != NETWORK_OK) remove(filepath);
+    return result;
 }
 
-int DownloadImage(const char *url, const char *filepath, const char *user, const char *pass) {
+NetworkResult DownloadImage(const char *url, const char *filepath, const OPDSServer *server,
+                            int server_index) {
     CURL *curl;
-    CURLcode res;
-    FILE *fp;
-
+    CURLcode code;
+    FILE *file;
     char safe_url[MAX_STR_LEN * 2] = {0};
-    EnsureAbsoluteURL(url, safe_url);
+    char cookie_path[MAX_STR_LEN * 2] = {0};
 
-    fp = fopen(filepath, "wb");
-    if (!fp) return -1;
+    if (!url || !filepath) return NETWORK_ERROR;
+    EnsureAbsoluteURL(url, safe_url);
+    file = fopen(filepath, "wb");
+    if (!file) return NETWORK_ERROR;
 
     curl = curl_easy_init();
-    if (!curl) { fclose(fp); return -1; }
-
-    // Relaxed Network Timeouts (30 seconds)
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
-    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 30L);
-    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
-
-    curl_easy_setopt(curl, CURLOPT_URL, safe_url);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteFileCallback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, APP_USER_AGENT);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
-
-    if (user && pass && strlen(user) > 0) {
-        curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
-        char auth[512]; snprintf(auth, sizeof(auth), "%s:%s", user, pass);
-        curl_easy_setopt(curl, CURLOPT_USERPWD, auth);
+    if (!curl) {
+        fclose(file);
+        remove(filepath);
+        return NETWORK_ERROR;
     }
 
-    res = curl_easy_perform(curl);
-    curl_easy_cleanup(curl);
-    fclose(fp);
+    if (ConfigureCommonRequest(curl, safe_url, server, server_index, cookie_path, sizeof(cookie_path)) != 0) {
+        curl_easy_cleanup(curl);
+        fclose(file);
+        remove(filepath);
+        return NETWORK_ERROR;
+    }
 
-    if (res != CURLE_OK) { remove(filepath); return -1; }
-    return 0;
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteFileCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, file);
+    code = curl_easy_perform(curl);
+    NetworkResult result = FinishRequest(curl, code, safe_url, server, cookie_path);
+    fclose(file);
+
+    if (result != NETWORK_OK) remove(filepath);
+    return result;
 }
