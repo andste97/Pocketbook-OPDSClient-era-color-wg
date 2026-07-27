@@ -1,0 +1,76 @@
+name: Build and release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    env:
+      SDK_IMAGE: andi97/pocketbook-dev-docker:6.8-b300-r1
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Build with PocketBook SDK 6.8 B300
+        run: |
+          docker pull "$SDK_IMAGE"
+          docker run --rm \
+            -u "$(id -u):$(id -g)" \
+            -v "$GITHUB_WORKSPACE:/project" \
+            -w /project \
+            "$SDK_IMAGE" \
+            -lc 'set -euo pipefail; export LD_LIBRARY_PATH="$SDK_BASE/usr/lib"; make clean; make -j"$(nproc)" SDK_PATH="$SDK_BASE/usr"'
+
+      - name: Validate application binary
+        run: |
+          test -s OPDSClient.app
+
+          file_output="$(file OPDSClient.app)"
+          echo "$file_output"
+          grep -q 'ELF 32-bit.*ARM' <<<"$file_output"
+
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/project:ro" \
+            -w /project \
+            "$SDK_IMAGE" \
+            -lc '
+              set -euo pipefail
+              export LD_LIBRARY_PATH="$SDK_BASE/usr/lib"
+              readelf_output="$("$SDK_BASE/usr/bin/arm-obreey-linux-gnueabi-readelf" -h OPDSClient.app)"
+              echo "$readelf_output"
+              grep -q "Machine:.*ARM" <<<"$readelf_output"
+              grep -q "Version5 EABI, soft-float ABI" <<<"$readelf_output"
+            '
+
+      - name: Create release identifier
+        id: release
+        run: |
+          timestamp="$(date -u +'%Y%m%d-%H%M%S')"
+          short_sha="$(git rev-parse --short=7 HEAD)"
+          release_id="build-${timestamp}-${short_sha}"
+          echo "id=$release_id" >> "$GITHUB_OUTPUT"
+          echo "title=PocketBook OPDS Client ${timestamp}-${short_sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.release.outputs.id }}
+          RELEASE_TITLE: ${{ steps.release.outputs.title }}
+        run: |
+          gh release create "$RELEASE_ID" \
+            "OPDSClient.app#OPDSClient.app" \
+            --target "$GITHUB_SHA" \
+            --title "$RELEASE_TITLE" \
+            --generate-notes
