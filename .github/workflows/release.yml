@@ -23,6 +23,9 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
+      - name: Run unit tests
+        run: make test
+
       - name: Build with PocketBook SDK 6.8 B300
         run: |
           docker pull "$SDK_IMAGE"
