@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <errno.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <dlfcn.h> // Included for dynamic library loading (dlsym)
@@ -40,30 +41,6 @@ int entry_count = 0;
 char current_host[MAX_STR_LEN];
 int sys_width, sys_height;
 
-// Debug logging mechanism (triggered only if LOGTRIGGER.TXT is present)
-void LogDebug(const char *msg) {
-    char trigger_file[MAX_STR_LEN];
-    snprintf(trigger_file, sizeof(trigger_file), "%sLOGTRIGGER.TXT", APP_ROOT_DIR);
-
-    // Exit early if the trigger file is absent to preserve device performance
-    if (access(trigger_file, F_OK) != 0) {
-        return; 
-    }
-
-    char log_file[MAX_STR_LEN];
-    snprintf(log_file, sizeof(log_file), "%sopds_client.log", APP_ROOT_DIR);
-
-    FILE *f = fopen(log_file, "a");
-    if (f) {
-        time_t now;
-        time(&now);
-        char *date = ctime(&now);
-        date[strlen(date) - 1] = '\0'; // Strip the default newline from ctime
-        fprintf(f, "[%s] %s\n", date, msg);
-        fclose(f);
-    }
-}
-
 // External UI Handlers
 extern void DrawMainMenu();
 extern void HandleMainMenuTouch(int x, int y);
@@ -93,6 +70,7 @@ void Repaint() {
 }
 
 int SaveServers() {
+    LogMessage(LOG_LEVEL_INFO, "Saving configuration for %d server(s)", server_count);
     // Ensure the application directory exists before attempting to save!
     mkdir(APP_ROOT_DIR, 0777);
 
@@ -103,7 +81,7 @@ int SaveServers() {
     // Use InkView's built-in config system
     iconfig *cfg = OpenConfig(NEW_CFG_FILE, NULL);
     if (!cfg) {
-        LogDebug("Failed to open config for saving.");
+        LogMessage(LOG_LEVEL_ERROR, "Failed to open configuration for saving");
         return -1;
     }
 
@@ -140,13 +118,17 @@ int SaveServers() {
     int save_result = SaveConfig(cfg);
     CloseConfig(cfg);
     if (save_result != 0 || chmod(NEW_CFG_FILE, 0600) != 0) {
-        LogDebug("Failed to save config or restrict its permissions.");
+        LogMessage(LOG_LEVEL_ERROR,
+                   "Failed to save configuration or restrict permissions (save=%d errno=%d)",
+                   save_result, errno);
         return -1;
     }
+    LogMessage(LOG_LEVEL_INFO, "Configuration saved successfully");
     return 0;
 }
 
 void LoadServers() {
+    LogMessage(LOG_LEVEL_INFO, "Loading server configuration");
     // Ensure the app directory is available immediately on boot
     mkdir(APP_ROOT_DIR, 0777);
     mkdir(AUTH_DIR, 0700);
@@ -191,8 +173,13 @@ void LoadServers() {
 
             CloseConfig(cfg);
             if (chmod(NEW_CFG_FILE, 0600) != 0) {
-                LogDebug("Failed to restrict config file permissions.");
+                LogMessage(LOG_LEVEL_WARNING,
+                           "Failed to restrict configuration permissions: errno=%d", errno);
             }
+            LogMessage(LOG_LEVEL_INFO, "Loaded %d server(s) from current configuration",
+                       server_count);
+        } else {
+            LogMessage(LOG_LEVEL_ERROR, "OpenConfig failed for existing configuration");
         }
         return; // Successfully loaded from new location
     }
@@ -261,11 +248,14 @@ void LoadServers() {
             
             // Save immediately in the new robust text format at the NEW location
             if (SaveServers() != 0) {
-                LogDebug("Failed to save migrated server configuration.");
+                LogMessage(LOG_LEVEL_ERROR, "Failed to save migrated server configuration");
+            } else {
+                LogMessage(LOG_LEVEL_INFO, "Legacy configuration migration completed");
             }
         }
     } else {
         server_count = 0;
+        LogMessage(LOG_LEVEL_INFO, "No configuration found; starting with an empty server list");
     }
 }
 
@@ -273,11 +263,13 @@ static int main_handler(int event, int a, int b) {
     switch (event) {
 
         case EVT_INIT:
+            LogMessage(LOG_LEVEL_INFO, "EVT_INIT received");
             sys_width = ScreenWidth();
             sys_height = ScreenHeight();
+            LogMessage(LOG_LEVEL_INFO, "Screen dimensions: %dx%d", sys_width, sys_height);
             LoadServers();
             InitNetwork();
-            LogDebug("--- App Started ---");
+            LogMessage(LOG_LEVEL_INFO, "Application initialization completed");
 
             // --- Dynamic Loading for Dark Mode (FW 6.8+) ---
             // Try to open the inkview library to see if it supports native screen inversion
@@ -294,11 +286,14 @@ static int main_handler(int event, int a, int b) {
                 }
                 // Not calling dlclose(lib_handle) intentionally, as inkview is a core system 
                 // dependency permanently linked to our app's lifetime anyway.
+            } else {
+                LogMessage(LOG_LEVEL_WARNING, "Unable to open libinkview for capability detection");
             }
             break;
 
         case EVT_SHOW:
         case EVT_FOREGROUND:
+            LogMessage(LOG_LEVEL_INFO, "Application shown/foregrounded (event=%d)", event);
             // Handle app un-minimization or device waking from sleep
             SetPanelType(0); 
             Repaint();       
@@ -306,6 +301,7 @@ static int main_handler(int event, int a, int b) {
             
         case EVT_BACKGROUND:
             // Handle device sleep or app minimization
+            LogMessage(LOG_LEVEL_INFO, "Application moved to background");
             break;
 
         case EVT_CONFIGCHANGED:
@@ -343,6 +339,7 @@ static int main_handler(int event, int a, int b) {
             break;
 
         case EVT_EXIT:
+            LogMessage(LOG_LEVEL_INFO, "EVT_EXIT received; cleaning up");
             CancelAuthUI();
             CleanupNetwork();
             break;
@@ -351,6 +348,13 @@ static int main_handler(int event, int a, int b) {
 }
 
 int main(int argc, char *argv[]) {
+    (void)argc;
+    (void)argv;
+    InitLogger();
+    InstallCrashHandlers();
+    LogMessage(LOG_LEVEL_INFO, "Entering InkViewMain");
     InkViewMain(main_handler);
+    LogMessage(LOG_LEVEL_INFO, "InkViewMain returned");
+    ShutdownLogger();
     return 0;
 }

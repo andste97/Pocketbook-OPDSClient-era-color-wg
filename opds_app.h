@@ -3,6 +3,7 @@
 
 #include <inkview.h>
 #include <stddef.h> 
+#include <stdarg.h>
 
 // libxml2 headers for OPDS parsing
 #include <libxml/parser.h>
@@ -19,6 +20,7 @@
 #define IMAGES_DIR APP_ROOT_DIR "images/"
 #define AUTH_DIR APP_ROOT_DIR "auth/"
 #define BOOKS_DIR "/mnt/ext1/Downloads/"
+#define LOG_FILE_PATH APP_ROOT_DIR "opds_client.log"
 
 // New and Legacy Config File Locations
 #define NEW_CFG_FILE APP_ROOT_DIR "opds_client.cfg"
@@ -78,6 +80,13 @@ typedef enum {
     AUTH_PENDING_BOOK,
     AUTH_PENDING_SEARCH
 } AuthPendingType;
+
+typedef enum {
+    LOG_LEVEL_DEBUG = 0,
+    LOG_LEVEL_INFO,
+    LOG_LEVEL_WARNING,
+    LOG_LEVEL_ERROR
+} LogLevel;
 
 typedef struct {
     char name[MAX_STR_LEN];
@@ -139,10 +148,17 @@ extern int total_results;
 
 // --- Function Prototypes ---
 struct MemoryStruct { char *memory; size_t size; };
+void InitLogger(void);
+void InstallCrashHandlers(void);
+void ShutdownLogger(void);
+void LogDebug(const char *message);
+void LogMessage(LogLevel level, const char *format, ...)
+    __attribute__((format(printf, 2, 3)));
 void InitNetwork(void);
 void CleanupNetwork(void);
 void EnsureAbsoluteURL(const char *in_url, char *out_url);
 void RedactHTTPHeader(const char *line, char *out, size_t out_size);
+void RedactURLForLog(const char *url, char *out, size_t out_size);
 int URLsHaveSameOrigin(const char *left, const char *right);
 int RequestUsesServerCredentials(const OPDSServer *server, const char *url);
 NetworkResult ClassifyNetworkResponse(int curl_code, long http_code,

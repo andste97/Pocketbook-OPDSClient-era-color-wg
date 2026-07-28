@@ -51,7 +51,6 @@ typedef struct {
 #define ASSERT_EQ_INT(expected, actual) ASSERT_TRUE((expected) == (actual))
 #define ASSERT_STREQ(expected, actual) ASSERT_TRUE(strcmp((expected), (actual)) == 0)
 
-void LogDebug(const char *msg) { (void)msg; }
 void ShowDownloadProgress(long long total, long long current) { (void)total; (void)current; }
 int CheckDownloadCancel(void) { return 0; }
 
@@ -376,6 +375,11 @@ static void test_network_helpers(void) {
     ASSERT_STREQ("Cookie: [REDACTED]", output);
     RedactHTTPHeader("Content-Type: application/atom+xml", output, sizeof(output));
     ASSERT_STREQ("Content-Type: application/atom+xml", output);
+    RedactURLForLog("https://user@books.example.com/opds?token=secret#fragment",
+                    output, sizeof(output));
+    ASSERT_STREQ("https://[REDACTED]@books.example.com/opds?[REDACTED]", output);
+    RedactURLForLog("https://books.example.com/opds#private", output, sizeof(output));
+    ASSERT_STREQ("https://books.example.com/opds#[REDACTED]", output);
 
     ASSERT_TRUE(URLsHaveSameOrigin("https://books.example.com/a", "https://books.example.com/b"));
     ASSERT_TRUE(URLsHaveSameOrigin("https://books.example.com", "https://books.example.com:443/path"));

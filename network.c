@@ -17,8 +17,15 @@ extern char current_host[MAX_STR_LEN];
 static int network_initialized;
 
 void InitNetwork(void) {
-    if (!network_initialized && curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK) {
-        network_initialized = 1;
+    if (!network_initialized) {
+        CURLcode result = curl_global_init(CURL_GLOBAL_DEFAULT);
+        if (result == CURLE_OK) {
+            network_initialized = 1;
+            LogMessage(LOG_LEVEL_INFO, "libcurl initialized");
+        } else {
+            LogMessage(LOG_LEVEL_ERROR, "libcurl initialization failed: %s",
+                       curl_easy_strerror(result));
+        }
     }
 }
 
@@ -26,6 +33,7 @@ void CleanupNetwork(void) {
     if (network_initialized) {
         curl_global_cleanup();
         network_initialized = 0;
+        LogMessage(LOG_LEVEL_INFO, "libcurl cleaned up");
     }
 }
 
@@ -109,6 +117,58 @@ void RedactHTTPHeader(const char *line, char *out, size_t out_size) {
     }
 
     snprintf(out, out_size, "%s", line);
+}
+
+static size_t CopyLogSegment(char *out, size_t position, size_t out_size,
+                             const char *start, const char *end) {
+    while (start < end && position + 1 < out_size) out[position++] = *start++;
+    return position;
+}
+
+void RedactURLForLog(const char *url, char *out, size_t out_size) {
+    const char *visible_end;
+    const char *scheme;
+    const char *authority;
+    const char *authority_end;
+    const char *at = NULL;
+    const char *source;
+    const char redacted_user[] = "[REDACTED]@";
+    const char redacted_query[] = "?[REDACTED]";
+    const char redacted_fragment[] = "#[REDACTED]";
+    size_t position = 0;
+
+    if (!out || out_size == 0) return;
+    out[0] = '\0';
+    if (!url) {
+        snprintf(out, out_size, "(null)");
+        return;
+    }
+
+    visible_end = strpbrk(url, "?#");
+    if (!visible_end) visible_end = url + strlen(url);
+    scheme = strstr(url, "://");
+    authority = scheme ? scheme + 3 : url;
+    authority_end = memchr(authority, '/', (size_t)(visible_end - authority));
+    if (!authority_end) authority_end = visible_end;
+    at = memchr(authority, '@', (size_t)(authority_end - authority));
+
+    source = url;
+    if (at) {
+        position = CopyLogSegment(out, position, out_size, url, authority);
+        position = CopyLogSegment(out, position, out_size, redacted_user,
+                                  redacted_user + sizeof(redacted_user) - 1);
+        source = at + 1;
+    }
+    position = CopyLogSegment(out, position, out_size, source, visible_end);
+
+    if (*visible_end == '?') {
+        position = CopyLogSegment(out, position, out_size, redacted_query,
+                                  redacted_query + sizeof(redacted_query) - 1);
+    } else if (*visible_end == '#') {
+        position = CopyLogSegment(out, position, out_size, redacted_fragment,
+                                  redacted_fragment + sizeof(redacted_fragment) - 1);
+    }
+    out[position] = '\0';
 }
 
 static void LogHeaderLines(const char *prefix, const char *data, size_t size) {
@@ -334,6 +394,7 @@ static NetworkResult FinishRequest(CURL *curl, CURLcode code, const char *reques
     long http_code = 0;
     char *effective_url = NULL;
     char *redirect_url = NULL;
+    char log_url[MAX_STR_LEN * 2];
 
     if (code == CURLE_OK) {
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
@@ -344,6 +405,11 @@ static NetworkResult FinishRequest(CURL *curl, CURLcode code, const char *reques
     const char *classification_url = redirect_url ? redirect_url : effective_url;
     NetworkResult result = ClassifyNetworkResponse(code, http_code, requested_url,
                                                    classification_url, server);
+    RedactURLForLog(requested_url, log_url, sizeof(log_url));
+    LogMessage(result == NETWORK_OK ? LOG_LEVEL_INFO : LOG_LEVEL_ERROR,
+               "HTTP request completed: curl=%d (%s), status=%ld, result=%d, url=%s",
+               (int)code, curl_easy_strerror(code), http_code, (int)result,
+               log_url);
     curl_easy_cleanup(curl);
     if (cookie_path && cookie_path[0]) chmod(cookie_path, 0600);
     return result;
@@ -355,9 +421,12 @@ NetworkResult FetchFeed(const char *url, const OPDSServer *server, int server_in
     CURLcode code;
     char safe_url[MAX_STR_LEN * 2] = {0};
     char cookie_path[MAX_STR_LEN * 2] = {0};
+    char log_url[MAX_STR_LEN * 2] = {0};
 
     if (!url || !chunk) return NETWORK_ERROR;
     EnsureAbsoluteURL(url, safe_url);
+    RedactURLForLog(safe_url, log_url, sizeof(log_url));
+    LogMessage(LOG_LEVEL_INFO, "Fetching OPDS feed: %s", log_url);
 
     chunk->memory = malloc(1);
     if (!chunk->memory) return NETWORK_ERROR;
@@ -373,7 +442,7 @@ NetworkResult FetchFeed(const char *url, const OPDSServer *server, int server_in
 
     LogDebug("================ NETWORK REQUEST START ================");
     char message[MAX_STR_LEN * 2 + 32];
-    snprintf(message, sizeof(message), "TARGET: [%s]", safe_url);
+    snprintf(message, sizeof(message), "TARGET: [%s]", log_url);
     LogDebug(message);
 
     if (ConfigureCommonRequest(curl, safe_url, server, server_index, cookie_path, sizeof(cookie_path)) != 0) {
@@ -399,6 +468,9 @@ NetworkResult FetchFeed(const char *url, const OPDSServer *server, int server_in
         chunk->size = 0;
     }
 
+    LogMessage(result == NETWORK_OK ? LOG_LEVEL_INFO : LOG_LEVEL_ERROR,
+               "OPDS feed fetch finished: result=%d bytes=%lu",
+               (int)result, (unsigned long)chunk->size);
     return result;
 }
 
@@ -409,9 +481,12 @@ NetworkResult DownloadBook(const char *url, const char *filepath, char *server_f
     FILE *file;
     char safe_url[MAX_STR_LEN * 2] = {0};
     char cookie_path[MAX_STR_LEN * 2] = {0};
+    char log_url[MAX_STR_LEN * 2] = {0};
 
     if (!url || !filepath) return NETWORK_ERROR;
     EnsureAbsoluteURL(url, safe_url);
+    RedactURLForLog(safe_url, log_url, sizeof(log_url));
+    LogMessage(LOG_LEVEL_INFO, "Starting book download: %s", log_url);
     file = fopen(filepath, "wb");
     if (!file) return NETWORK_ERROR;
     if (server_fname) server_fname[0] = '\0';
@@ -446,6 +521,8 @@ NetworkResult DownloadBook(const char *url, const char *filepath, char *server_f
     LogDebug("================ DOWNLOAD REQUEST END ================");
 
     if (result != NETWORK_OK) remove(filepath);
+    LogMessage(result == NETWORK_OK ? LOG_LEVEL_INFO : LOG_LEVEL_ERROR,
+               "Book download finished: result=%d", (int)result);
     return result;
 }
 
@@ -456,9 +533,11 @@ NetworkResult DownloadImage(const char *url, const char *filepath, const OPDSSer
     FILE *file;
     char safe_url[MAX_STR_LEN * 2] = {0};
     char cookie_path[MAX_STR_LEN * 2] = {0};
+    char log_url[MAX_STR_LEN * 2] = {0};
 
     if (!url || !filepath) return NETWORK_ERROR;
     EnsureAbsoluteURL(url, safe_url);
+    RedactURLForLog(safe_url, log_url, sizeof(log_url));
     file = fopen(filepath, "wb");
     if (!file) return NETWORK_ERROR;
 
@@ -482,6 +561,10 @@ NetworkResult DownloadImage(const char *url, const char *filepath, const OPDSSer
     NetworkResult result = FinishRequest(curl, code, safe_url, server, cookie_path);
     fclose(file);
 
-    if (result != NETWORK_OK) remove(filepath);
+    if (result != NETWORK_OK) {
+        LogMessage(LOG_LEVEL_WARNING, "Cover download failed: result=%d url=%s",
+                   (int)result, log_url);
+        remove(filepath);
+    }
     return result;
 }

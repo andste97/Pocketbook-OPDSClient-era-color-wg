@@ -128,14 +128,19 @@ static AutheliaResult PerformAuthRequest(const OPDSServer *server, int server_in
     CURLcode code;
     char url[MAX_STR_LEN * 2];
 
-    (void)server_index;
     if (!server || !path || !method || !cookie_path || !cookie_path[0] ||
         !response_code || !response) {
+        LogMessage(LOG_LEVEL_ERROR, "Invalid Authelia request configuration");
         return AUTHELIA_CONFIG_ERROR;
     }
     if (BuildAuthURL(server, path, url, sizeof(url)) != 0) return AUTHELIA_CONFIG_ERROR;
+    LogMessage(LOG_LEVEL_INFO, "Authelia request started: server=%d method=%s path=%s",
+               server_index, method, path);
 
-    if (mkdir(cookie_directory, 0700) != 0 && errno != EEXIST) return AUTHELIA_COOKIE_ERROR;
+    if (mkdir(cookie_directory, 0700) != 0 && errno != EEXIST) {
+        LogMessage(LOG_LEVEL_ERROR, "Unable to create cookie directory: errno=%d", errno);
+        return AUTHELIA_COOKIE_ERROR;
+    }
 
     response->data = malloc(1);
     if (!response->data) return AUTHELIA_HTTP_ERROR;
@@ -197,6 +202,8 @@ static AutheliaResult PerformAuthRequest(const OPDSServer *server, int server_in
         SecureZero(response->data, response->size);
         free(response->data);
         response->data = NULL;
+        LogMessage(LOG_LEVEL_ERROR, "Unable to restrict cookie-jar permissions: errno=%d",
+                   errno);
         return AUTHELIA_COOKIE_ERROR;
     }
 
@@ -205,9 +212,15 @@ static AutheliaResult PerformAuthRequest(const OPDSServer *server, int server_in
         SecureZero(response->data, response->size);
         free(response->data);
         response->data = NULL;
+        LogMessage(LOG_LEVEL_ERROR,
+                   "Authelia request failed: server=%d path=%s curl=%d (%s) result=%d",
+                   server_index, path, (int)code, curl_easy_strerror(code), (int)result);
         return result;
     }
 
+    LogMessage(LOG_LEVEL_INFO,
+               "Authelia request finished: server=%d path=%s status=%ld bytes=%lu",
+               server_index, path, *response_code, (unsigned long)response->size);
     return AUTHELIA_OK;
 }
 
@@ -221,8 +234,10 @@ static AutheliaResult VerifyAndCommitSession(const OPDSServer *server, int serve
 
     if (!server || !CookieJarIsUsable(staging_path) ||
         AuthGetCookieJarPath(server_index, persistent_path, sizeof(persistent_path)) != 0) {
+        LogMessage(LOG_LEVEL_ERROR, "Cannot verify staged session for server=%d", server_index);
         return AUTHELIA_COOKIE_ERROR;
     }
+    LogMessage(LOG_LEVEL_INFO, "Verifying staged Authelia session for server=%d", server_index);
 
     curl = curl_easy_init();
     if (!curl) return AUTHELIA_HTTP_ERROR;
@@ -257,16 +272,32 @@ static AutheliaResult VerifyAndCommitSession(const OPDSServer *server, int serve
                              !URLsHaveSameOrigin(server->url, server->auth_url);
     curl_easy_cleanup(curl);
 
-    if (code != CURLE_OK) return ClassifyTransportError(code);
-    if (http_code == 401 || redirected_to_auth) return AUTHELIA_COOKIE_ERROR;
-    if (http_code < 200 || http_code >= 300) return AUTHELIA_HTTP_ERROR;
+    if (code != CURLE_OK) {
+        AutheliaResult result = ClassifyTransportError(code);
+        LogMessage(LOG_LEVEL_ERROR, "Session verification transport failed: curl=%d result=%d",
+                   (int)code, (int)result);
+        return result;
+    }
+    if (http_code == 401 || redirected_to_auth) {
+        LogMessage(LOG_LEVEL_ERROR,
+                   "Session verification rejected: status=%ld redirected_to_auth=%d",
+                   http_code, redirected_to_auth);
+        return AUTHELIA_COOKIE_ERROR;
+    }
+    if (http_code < 200 || http_code >= 300) {
+        LogMessage(LOG_LEVEL_ERROR, "Session verification returned HTTP %ld", http_code);
+        return AUTHELIA_HTTP_ERROR;
+    }
     if (!CookieJarIsUsable(staging_path) || chmod(staging_path, 0600) != 0) {
         return AUTHELIA_COOKIE_ERROR;
     }
     if (rename(staging_path, persistent_path) != 0 || chmod(persistent_path, 0600) != 0) {
+        LogMessage(LOG_LEVEL_ERROR, "Unable to commit session cookie for server=%d: errno=%d",
+                   server_index, errno);
         return AUTHELIA_COOKIE_ERROR;
     }
 
+    LogMessage(LOG_LEVEL_INFO, "Authelia session committed for server=%d", server_index);
     return AUTHELIA_OK;
 }
 
@@ -318,6 +349,7 @@ int AuthDeleteCookieJar(int server_index) {
     if (GetStagingCookieJarPath(server_index, staging_path, sizeof(staging_path)) != 0) return -1;
     if (remove(path) != 0 && errno != ENOENT) return -1;
     if (remove(staging_path) != 0 && errno != ENOENT) return -1;
+    LogMessage(LOG_LEVEL_INFO, "Cleared saved and staged sessions for server=%d", server_index);
     return 0;
 }
 
@@ -330,6 +362,9 @@ int AuthCancelLogin(int server_index) {
 
 int AuthShiftCookieJarsAfterDelete(int deleted_index, int previous_count) {
     if (deleted_index < 0 || previous_count < 1 || deleted_index >= previous_count) return -1;
+    LogMessage(LOG_LEVEL_INFO,
+               "Reindexing cookie jars after deleting server=%d previous_count=%d",
+               deleted_index, previous_count);
 
     for (int i = 0; i < previous_count; i++) {
         if (AuthCancelLogin(i) != 0) return -1;
@@ -372,6 +407,7 @@ int AuthShiftCookieJarsAfterDelete(int deleted_index, int previous_count) {
     if (remove(deleted_temporary) != 0 && errno != ENOENT) {
         goto rollback_shifted;
     }
+    LogMessage(LOG_LEVEL_INFO, "Cookie-jar reindex completed");
     return 0;
 
 rollback_shifted:
@@ -393,6 +429,7 @@ rollback_staging:
             rename(temporary, original);
         }
     }
+    LogMessage(LOG_LEVEL_ERROR, "Cookie-jar reindex failed and was rolled back");
     return -1;
 }
 
@@ -405,9 +442,11 @@ AutheliaResult AutheliaFirstFactor(const OPDSServer *server, int server_index,
     AutheliaResult result;
     char staging_path[MAX_STR_LEN * 2];
 
+    LogMessage(LOG_LEVEL_INFO, "Starting Authelia first-factor flow for server=%d", server_index);
     if (!server || server->auth_mode != AUTH_MODE_AUTHELIA_COOKIE ||
         !username || !username[0] || !password || !password[0] ||
         !IsHTTPSURL(server->url)) {
+        LogMessage(LOG_LEVEL_ERROR, "Authelia first-factor configuration is invalid");
         return AUTHELIA_CONFIG_ERROR;
     }
     if (GetStagingCookieJarPath(server_index, staging_path, sizeof(staging_path)) != 0) {
@@ -472,6 +511,9 @@ AutheliaResult AutheliaFirstFactor(const OPDSServer *server, int server_index,
     SecureZero(response.data, response.size);
     free(response.data);
     if (result != AUTHELIA_OK) remove(staging_path);
+    LogMessage(result == AUTHELIA_OK ? LOG_LEVEL_INFO : LOG_LEVEL_ERROR,
+               "Authelia first-factor flow finished: server=%d result=%d",
+               server_index, (int)result);
     return result;
 }
 
@@ -484,7 +526,9 @@ AutheliaResult AutheliaCompleteTOTP(const OPDSServer *server, int server_index, 
     size_t len;
     char staging_path[MAX_STR_LEN * 2];
 
+    LogMessage(LOG_LEVEL_INFO, "Starting Authelia TOTP flow for server=%d", server_index);
     if (!server || server->auth_mode != AUTH_MODE_AUTHELIA_COOKIE || !totp) {
+        LogMessage(LOG_LEVEL_ERROR, "Authelia TOTP configuration is invalid");
         return AUTHELIA_CONFIG_ERROR;
     }
     len = strlen(totp);
@@ -528,6 +572,9 @@ AutheliaResult AutheliaCompleteTOTP(const OPDSServer *server, int server_index, 
 
     result = VerifyAndCommitSession(server, server_index, staging_path);
     if (result != AUTHELIA_OK) remove(staging_path);
+    LogMessage(result == AUTHELIA_OK ? LOG_LEVEL_INFO : LOG_LEVEL_ERROR,
+               "Authelia TOTP flow finished: server=%d result=%d",
+               server_index, (int)result);
     return result;
 }
 
@@ -537,6 +584,7 @@ AutheliaResult AutheliaLogout(const OPDSServer *server, int server_index) {
     AutheliaResult result = AUTHELIA_OK;
     char cookie_path[MAX_STR_LEN * 2];
 
+    LogMessage(LOG_LEVEL_INFO, "Starting Authelia logout for server=%d", server_index);
     if (AuthGetCookieJarPath(server_index, cookie_path, sizeof(cookie_path)) != 0) {
         return AUTHELIA_COOKIE_ERROR;
     }
@@ -553,6 +601,8 @@ AutheliaResult AutheliaLogout(const OPDSServer *server, int server_index) {
     }
     if (AuthDeleteCookieJar(server_index) != 0) return AUTHELIA_COOKIE_ERROR;
     if (AuthDeleteCookieJar(server_index) != 0) return AUTHELIA_COOKIE_ERROR;
+    LogMessage(result == AUTHELIA_OK ? LOG_LEVEL_INFO : LOG_LEVEL_WARNING,
+               "Authelia logout finished: server=%d result=%d", server_index, (int)result);
     return result;
 }
 

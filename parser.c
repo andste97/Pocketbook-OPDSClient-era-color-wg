@@ -39,9 +39,16 @@ static void ResolveURL(xmlDocPtr doc, xmlNodePtr node, const char *base_url, con
 
 // Parses an OpenSearch Description document to extract the dynamic search template
 int ParseOpenSearch(const char *xml_data, const char *base_url, char *template_out) {
-    if (!xml_data) return -1;
+    if (!xml_data) {
+        LogMessage(LOG_LEVEL_ERROR, "OpenSearch parsing called without XML data");
+        return -1;
+    }
+    LogMessage(LOG_LEVEL_INFO, "Parsing OpenSearch description");
     xmlDocPtr doc = xmlReadMemory(xml_data, strlen(xml_data), base_url, NULL, XML_PARSE_NOERROR | XML_PARSE_RECOVER);
-    if (!doc) return -1;
+    if (!doc) {
+        LogMessage(LOG_LEVEL_ERROR, "Unable to parse OpenSearch XML");
+        return -1;
+    }
     xmlXPathContextPtr ctx = xmlXPathNewContext(doc);
     
     xmlXPathObjectPtr obj = xmlXPathEvalExpression((xmlChar*)"//*[local-name()='Url']", ctx);
@@ -81,6 +88,8 @@ int ParseOpenSearch(const char *xml_data, const char *base_url, char *template_o
     if (obj) xmlXPathFreeObject(obj);
     xmlXPathFreeContext(ctx);
     xmlFreeDoc(doc);
+    LogMessage(found ? LOG_LEVEL_INFO : LOG_LEVEL_WARNING,
+               "OpenSearch parsing finished: template_found=%d", found);
     return found ? 0 : -1;
 }
 
@@ -161,7 +170,11 @@ static void GetAuthorName(xmlNodePtr parent, char *out, int max_len) {
 }
 
 int ParseOPDSFeed(const char *xml_data, const char *base_url) {
-    if (!xml_data) return -1;
+    if (!xml_data) {
+        LogMessage(LOG_LEVEL_ERROR, "OPDS parsing called without XML data");
+        return -1;
+    }
+    LogMessage(LOG_LEVEL_INFO, "Parsing OPDS feed (%lu bytes)", (unsigned long)strlen(xml_data));
     
     entry_count = 0;
     next_page_url[0] = '\0';
@@ -172,7 +185,10 @@ int ParseOPDSFeed(const char *xml_data, const char *base_url) {
     size_t size = strlen(xml_data);
     
     xmlDocPtr doc = xmlReadMemory(xml_data, size, base_url, NULL, XML_PARSE_NOERROR | XML_PARSE_RECOVER);
-    if (!doc) return -1;
+    if (!doc) {
+        LogMessage(LOG_LEVEL_ERROR, "Unable to parse OPDS XML");
+        return -1;
+    }
     
     xmlXPathContextPtr ctx = xmlXPathNewContext(doc);
 
@@ -316,5 +332,9 @@ int ParseOPDSFeed(const char *xml_data, const char *base_url) {
 
     xmlXPathFreeContext(ctx);
     xmlFreeDoc(doc);
+    LogMessage(LOG_LEVEL_INFO,
+               "OPDS parsing finished: entries=%d total=%d next_page=%s search=%s",
+               entry_count, total_results, next_page_url[0] ? "yes" : "no",
+               current_search_url[0] ? "yes" : "no");
     return 0;
 }
