@@ -230,9 +230,6 @@ static void CrashSignalHandler(int signal_number, siginfo_t *info, void *context
 
     WriteCrashContext(output_fd, context);
     WriteAll(output_fd, "=== END FATAL SIGNAL ===\n", 25);
-    if (log_fd >= 0) fsync(log_fd);
-
-    kill(getpid(), signal_number);
     _exit(128 + signal_number);
 }
 

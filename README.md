@@ -129,8 +129,8 @@ Passwords, TOTP values, authorization and cookie headers, URL user information,
 queries, and fragments are not logged.
 
 Fatal signals (`SIGSEGV`, `SIGABRT`, `SIGBUS`, `SIGILL`, and `SIGFPE`) are
-captured on an alternate signal stack. Using only signal-safe operations, the
-logger writes the signal, fault address, faulting program counter, return
+captured on an alternate signal stack. The crash handler avoids heap allocation
+and stdio, writing the signal, fault address, faulting program counter, return
 address where the architecture provides one, and stack/frame pointers before
 the process exits. Keep the matching `OPDSClient.app` binary if those addresses
 need to be symbolized.

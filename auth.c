@@ -600,7 +600,6 @@ AutheliaResult AutheliaLogout(const OPDSServer *server, int server_index) {
         }
     }
     if (AuthDeleteCookieJar(server_index) != 0) return AUTHELIA_COOKIE_ERROR;
-    if (AuthDeleteCookieJar(server_index) != 0) return AUTHELIA_COOKIE_ERROR;
     LogMessage(result == AUTHELIA_OK ? LOG_LEVEL_INFO : LOG_LEVEL_WARNING,
                "Authelia logout finished: server=%d result=%d", server_index, (int)result);
     return result;
