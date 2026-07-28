@@ -13,7 +13,7 @@ OBJ = $(SRC:.c=.o)
 LDFLAGS = -L$(SYSROOT)/usr/lib \
           -linkview -lcurl -lxml2 -ljson-c -lfreetype -lm -ldl
 
-CFLAGS = -Wall -O2 -g -funwind-tables -fno-omit-frame-pointer \
+CFLAGS = -Wall -O2 -g -fno-omit-frame-pointer \
          -I$(SYSROOT)/usr/include \
          -I$(SYSROOT)/usr/include/libxml2 \
          -I$(SYSROOT)/usr/include/freetype2

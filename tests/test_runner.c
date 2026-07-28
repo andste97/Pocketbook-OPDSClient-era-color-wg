@@ -375,6 +375,11 @@ static void test_network_helpers(void) {
     ASSERT_STREQ("Cookie: [REDACTED]", output);
     RedactHTTPHeader("Content-Type: application/atom+xml", output, sizeof(output));
     ASSERT_STREQ("Content-Type: application/atom+xml", output);
+    RedactHTTPHeader("GET /opds?token=hidden HTTP/1.1", output, sizeof(output));
+    ASSERT_STREQ("GET /opds?[REDACTED] HTTP/1.1", output);
+    RedactHTTPHeader("Location: https://auth.example.com/callback?code=hidden",
+                     output, sizeof(output));
+    ASSERT_STREQ("Location: https://auth.example.com/callback?[REDACTED]", output);
     RedactURLForLog("https://user@books.example.com/opds?token=secret#fragment",
                     output, sizeof(output));
     ASSERT_STREQ("https://[REDACTED]@books.example.com/opds?[REDACTED]", output);

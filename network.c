@@ -106,6 +106,13 @@ void RedactHTTPHeader(const char *line, char *out, size_t out_size) {
         "Cookie",
         "Set-Cookie"
     };
+    const char *url_headers[] = {
+        "Location",
+        "Content-Location",
+        "Referer",
+        "Link",
+        "Refresh"
+    };
 
     if (!line || !out || out_size == 0) return;
 
@@ -114,6 +121,32 @@ void RedactHTTPHeader(const char *line, char *out, size_t out_size) {
             snprintf(out, out_size, "%s: [REDACTED]", sensitive[i]);
             return;
         }
+    }
+
+    for (size_t i = 0; i < sizeof(url_headers) / sizeof(url_headers[0]); i++) {
+        if (HeaderNameMatches(line, url_headers[i])) {
+            char redacted_url[512];
+            const char *value = strchr(line, ':') + 1;
+            while (*value == ' ' || *value == '\t') value++;
+            RedactURLForLog(value, redacted_url, sizeof(redacted_url));
+            snprintf(out, out_size, "%s: %s", url_headers[i], redacted_url);
+            return;
+        }
+    }
+
+    const char *target_start = strchr(line, ' ');
+    const char *http_version = target_start ? strstr(target_start + 1, " HTTP/") : NULL;
+    if (target_start && http_version) {
+        char target[512];
+        char redacted_target[512];
+        size_t target_length = (size_t)(http_version - target_start - 1);
+        if (target_length >= sizeof(target)) target_length = sizeof(target) - 1;
+        memcpy(target, target_start + 1, target_length);
+        target[target_length] = '\0';
+        RedactURLForLog(target, redacted_target, sizeof(redacted_target));
+        snprintf(out, out_size, "%.*s %s%s", (int)(target_start - line), line,
+                 redacted_target, http_version);
+        return;
     }
 
     snprintf(out, out_size, "%s", line);

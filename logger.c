@@ -11,13 +11,12 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <ucontext.h>
 #include <unistd.h>
-#include <unwind.h>
 
 #define LOG_FILE LOG_FILE_PATH
 #define PREVIOUS_LOG_FILE APP_ROOT_DIR "opds_client.previous.log"
 #define MAX_LOG_SIZE (2 * 1024 * 1024)
-#define MAX_STACK_FRAMES 32
 #define CRASH_STACK_SIZE (64 * 1024)
 
 static int log_fd = -1;
@@ -68,15 +67,25 @@ static size_t AppendUnsigned(char *buffer, size_t position, size_t capacity,
     return position;
 }
 
-static void RotateLogIfNeeded(void) {
+static int RotateLogIfNeeded(void) {
     struct stat info;
+    int result = 0;
+
+    if (chmod(PREVIOUS_LOG_FILE, 0600) != 0 && errno != ENOENT) result = -1;
     if (stat(LOG_FILE, &info) == 0 && info.st_size >= MAX_LOG_SIZE) {
-        unlink(PREVIOUS_LOG_FILE);
-        rename(LOG_FILE, PREVIOUS_LOG_FILE);
+        if (chmod(LOG_FILE, 0600) != 0) result = -1;
+        if (unlink(PREVIOUS_LOG_FILE) != 0 && errno != ENOENT) result = -1;
+        if (rename(LOG_FILE, PREVIOUS_LOG_FILE) != 0 ||
+            chmod(PREVIOUS_LOG_FILE, 0600) != 0) {
+            result = -1;
+        }
     }
+    return result;
 }
 
 void InitLogger(void) {
+    int rotation_result;
+
     if (log_fd >= 0) return;
 
     if (mkdir(APP_ROOT_DIR, 0777) != 0 && errno != EEXIST) {
@@ -84,13 +93,17 @@ void InitLogger(void) {
         return;
     }
 
-    RotateLogIfNeeded();
+    rotation_result = RotateLogIfNeeded();
     log_fd = open(LOG_FILE, O_WRONLY | O_CREAT | O_APPEND, 0600);
     if (log_fd < 0) {
         WriteAll(STDERR_FILENO, "OPDSClient: unable to open log file\n", 36);
         return;
     }
     chmod(LOG_FILE, 0600);
+    if (rotation_result != 0) {
+        LogMessage(LOG_LEVEL_WARNING, "Log rotation or permission update failed: errno=%d",
+                   errno);
+    }
     LogMessage(LOG_LEVEL_INFO, "Logger initialized (pid=%ld)", (long)getpid());
 }
 
@@ -136,35 +149,70 @@ void LogDebug(const char *message) {
     LogMessage(LOG_LEVEL_DEBUG, "%s", message ? message : "(null)");
 }
 
-typedef struct {
-    unsigned int frame;
-} StackTraceState;
-
-static _Unwind_Reason_Code WriteStackFrame(struct _Unwind_Context *context, void *argument) {
-    StackTraceState *state = (StackTraceState *)argument;
-    uintptr_t address = (uintptr_t)_Unwind_GetIP(context);
-    char line[384];
+static void WriteRegisterFrame(int fd, unsigned int frame, const char *name,
+                               uintptr_t address) {
+    char line[128];
     size_t position = 0;
 
-    if (!address) return _URC_NO_REASON;
     position = AppendText(line, position, sizeof(line), "  #");
-    position = AppendUnsigned(line, position, sizeof(line), state->frame, 10);
+    position = AppendUnsigned(line, position, sizeof(line), frame, 10);
     position = AppendText(line, position, sizeof(line), " 0x");
     position = AppendUnsigned(line, position, sizeof(line), (unsigned long)address, 16);
-
+    position = AppendText(line, position, sizeof(line), " ");
+    position = AppendText(line, position, sizeof(line), name);
     position = AppendText(line, position, sizeof(line), "\n");
-    WriteAll(log_fd >= 0 ? log_fd : STDERR_FILENO, line, position);
-    state->frame++;
-    return state->frame >= MAX_STACK_FRAMES ? _URC_END_OF_STACK : _URC_NO_REASON;
+    WriteAll(fd, line, position);
+}
+
+static void WriteCrashContext(int fd, void *context) {
+    uintptr_t pc = 0;
+    uintptr_t lr = 0;
+    uintptr_t sp = 0;
+    uintptr_t fp = 0;
+    char line[160];
+    size_t position = 0;
+
+#if defined(__arm__)
+    ucontext_t *machine_context = (ucontext_t *)context;
+    pc = (uintptr_t)machine_context->uc_mcontext.arm_pc;
+    lr = (uintptr_t)machine_context->uc_mcontext.arm_lr;
+    sp = (uintptr_t)machine_context->uc_mcontext.arm_sp;
+    fp = (uintptr_t)machine_context->uc_mcontext.arm_fp;
+#elif defined(__aarch64__)
+    ucontext_t *machine_context = (ucontext_t *)context;
+    pc = (uintptr_t)machine_context->uc_mcontext.pc;
+    lr = (uintptr_t)machine_context->uc_mcontext.regs[30];
+    sp = (uintptr_t)machine_context->uc_mcontext.sp;
+    fp = (uintptr_t)machine_context->uc_mcontext.regs[29];
+#elif defined(__x86_64__)
+    ucontext_t *machine_context = (ucontext_t *)context;
+    pc = (uintptr_t)machine_context->uc_mcontext.gregs[REG_RIP];
+    sp = (uintptr_t)machine_context->uc_mcontext.gregs[REG_RSP];
+    fp = (uintptr_t)machine_context->uc_mcontext.gregs[REG_RBP];
+#elif defined(__i386__)
+    ucontext_t *machine_context = (ucontext_t *)context;
+    pc = (uintptr_t)machine_context->uc_mcontext.gregs[REG_EIP];
+    sp = (uintptr_t)machine_context->uc_mcontext.gregs[REG_ESP];
+    fp = (uintptr_t)machine_context->uc_mcontext.gregs[REG_EBP];
+#else
+    pc = (uintptr_t)context;
+#endif
+
+    WriteRegisterFrame(fd, 0, "pc", pc);
+    if (lr) WriteRegisterFrame(fd, 1, "lr", lr);
+    position = AppendText(line, position, sizeof(line), "  sp=0x");
+    position = AppendUnsigned(line, position, sizeof(line), (unsigned long)sp, 16);
+    position = AppendText(line, position, sizeof(line), " fp=0x");
+    position = AppendUnsigned(line, position, sizeof(line), (unsigned long)fp, 16);
+    position = AppendText(line, position, sizeof(line), "\n");
+    WriteAll(fd, line, position);
 }
 
 static void CrashSignalHandler(int signal_number, siginfo_t *info, void *context) {
     char line[256];
     size_t position = 0;
-    StackTraceState trace = {0};
     int output_fd = log_fd >= 0 ? log_fd : STDERR_FILENO;
 
-    (void)context;
     if (handling_crash) _exit(128 + signal_number);
     handling_crash = 1;
 
@@ -175,10 +223,10 @@ static void CrashSignalHandler(int signal_number, siginfo_t *info, void *context
                               (unsigned long)(uintptr_t)(info ? info->si_addr : NULL), 16);
     position = AppendText(line, position, sizeof(line), " pid=");
     position = AppendUnsigned(line, position, sizeof(line), (unsigned long)getpid(), 10);
-    position = AppendText(line, position, sizeof(line), " ===\nStack trace:\n");
+    position = AppendText(line, position, sizeof(line), " ===\nStack context:\n");
     WriteAll(output_fd, line, position);
 
-    _Unwind_Backtrace(WriteStackFrame, &trace);
+    WriteCrashContext(output_fd, context);
     WriteAll(output_fd, "=== END FATAL SIGNAL ===\n", 25);
     if (log_fd >= 0) fsync(log_fd);
 
