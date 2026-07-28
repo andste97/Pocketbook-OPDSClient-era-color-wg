@@ -85,6 +85,7 @@ static int RotateLogIfNeeded(void) {
 
 void InitLogger(void) {
     int rotation_result;
+    int rotation_errno = 0;
 
     if (log_fd >= 0) return;
 
@@ -94,6 +95,7 @@ void InitLogger(void) {
     }
 
     rotation_result = RotateLogIfNeeded();
+    rotation_errno = errno;
     log_fd = open(LOG_FILE, O_WRONLY | O_CREAT | O_APPEND, 0600);
     if (log_fd < 0) {
         WriteAll(STDERR_FILENO, "OPDSClient: unable to open log file\n", 36);
@@ -102,7 +104,7 @@ void InitLogger(void) {
     chmod(LOG_FILE, 0600);
     if (rotation_result != 0) {
         LogMessage(LOG_LEVEL_WARNING, "Log rotation or permission update failed: errno=%d",
-                   errno);
+                   rotation_errno);
     }
     LogMessage(LOG_LEVEL_INFO, "Logger initialized (pid=%ld)", (long)getpid());
 }
