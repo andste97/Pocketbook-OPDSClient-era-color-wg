@@ -363,6 +363,7 @@ static void test_authelia_success_flow(void) {
 
 static void test_network_helpers(void) {
     char output[256];
+    char long_request[768];
     OPDSServer server;
     memset(&server, 0, sizeof(server));
     server.auth_mode = AUTH_MODE_AUTHELIA_COOKIE;
@@ -377,6 +378,13 @@ static void test_network_helpers(void) {
     ASSERT_STREQ("Content-Type: application/atom+xml", output);
     RedactHTTPHeader("GET /opds?token=hidden HTTP/1.1", output, sizeof(output));
     ASSERT_STREQ("GET /opds?[REDACTED] HTTP/1.1", output);
+    RedactHTTPHeader("GET /opds?token=hidden", output, sizeof(output));
+    ASSERT_STREQ("GET /opds?[REDACTED]", output);
+    memcpy(long_request, "GET /", 5);
+    memset(long_request + 5, 'a', 600);
+    strcpy(long_request + 605, "?token=hidden HTTP/1.1");
+    RedactHTTPHeader(long_request, output, sizeof(output));
+    ASSERT_STREQ("GET [TRUNCATED AND REDACTED] HTTP/1.1", output);
     RedactHTTPHeader("Location: https://auth.example.com/callback?code=hidden",
                      output, sizeof(output));
     ASSERT_STREQ("Location: https://auth.example.com/callback?[REDACTED]", output);

@@ -99,6 +99,24 @@ static char *FindCaseInsensitive(char *text, const char *needle) {
     return NULL;
 }
 
+static int IsHTTPRequestLine(const char *line, const char *first_space) {
+    const char *methods[] = {
+        "GET", "POST", "PUT", "PATCH", "DELETE",
+        "HEAD", "OPTIONS", "CONNECT", "TRACE"
+    };
+    size_t method_length;
+
+    if (!line || !first_space) return 0;
+    method_length = (size_t)(first_space - line);
+    for (size_t i = 0; i < sizeof(methods) / sizeof(methods[0]); i++) {
+        if (strlen(methods[i]) == method_length &&
+            strncmp(line, methods[i], method_length) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 void RedactHTTPHeader(const char *line, char *out, size_t out_size) {
     const char *sensitive[] = {
         "Authorization",
@@ -135,17 +153,23 @@ void RedactHTTPHeader(const char *line, char *out, size_t out_size) {
     }
 
     const char *target_start = strchr(line, ' ');
-    const char *http_version = target_start ? strstr(target_start + 1, " HTTP/") : NULL;
-    if (target_start && http_version) {
+    if (IsHTTPRequestLine(line, target_start)) {
         char target[512];
         char redacted_target[512];
-        size_t target_length = (size_t)(http_version - target_start - 1);
-        if (target_length >= sizeof(target)) target_length = sizeof(target) - 1;
-        memcpy(target, target_start + 1, target_length);
-        target[target_length] = '\0';
-        RedactURLForLog(target, redacted_target, sizeof(redacted_target));
+        const char *target_end = strchr(target_start + 1, ' ');
+        size_t target_length;
+
+        if (!target_end) target_end = line + strlen(line);
+        target_length = (size_t)(target_end - target_start - 1);
+        if (target_length >= sizeof(target)) {
+            snprintf(redacted_target, sizeof(redacted_target), "[TRUNCATED AND REDACTED]");
+        } else {
+            memcpy(target, target_start + 1, target_length);
+            target[target_length] = '\0';
+            RedactURLForLog(target, redacted_target, sizeof(redacted_target));
+        }
         snprintf(out, out_size, "%.*s %s%s", (int)(target_start - line), line,
-                 redacted_target, http_version);
+                 redacted_target, target_end);
         return;
     }
 
@@ -216,10 +240,13 @@ static void LogHeaderLines(const char *prefix, const char *data, size_t size) {
             char redacted[512];
             char message[MAX_STR_LEN + 32];
             size_t length = end - offset;
-            if (length >= sizeof(line)) length = sizeof(line) - 1;
-            memcpy(line, data + offset, length);
-            line[length] = '\0';
-            RedactHTTPHeader(line, redacted, sizeof(redacted));
+            if (length >= sizeof(line)) {
+                snprintf(redacted, sizeof(redacted), "[OVERSIZED HTTP LINE REDACTED]");
+            } else {
+                memcpy(line, data + offset, length);
+                line[length] = '\0';
+                RedactHTTPHeader(line, redacted, sizeof(redacted));
+            }
             snprintf(message, sizeof(message), "%s%s", prefix, redacted);
             LogDebug(message);
         }
