@@ -5,7 +5,7 @@ SYSROOT = $(SDK_PATH)/arm-obreey-linux-gnueabi/sysroot
 CC = $(SDK_PATH)/bin/arm-obreey-linux-gnueabi-gcc
 
 APP_NAME = OPDSClient.app
-SRC = main.c network.c parser.c ui.c app_logic.c auth.c
+SRC = main.c logger.c network.c parser.c ui.c app_logic.c auth.c
 OBJ = $(SRC:.c=.o)
 
 # LDFLAGS: Changed -lft2 to -lfreetype
@@ -13,7 +13,7 @@ OBJ = $(SRC:.c=.o)
 LDFLAGS = -L$(SYSROOT)/usr/lib \
           -linkview -lcurl -lxml2 -ljson-c -lfreetype -lm -ldl
 
-CFLAGS = -Wall -O2 \
+CFLAGS = -Wall -O2 -g -fno-omit-frame-pointer \
          -I$(SYSROOT)/usr/include \
          -I$(SYSROOT)/usr/include/libxml2 \
          -I$(SYSROOT)/usr/include/freetype2
@@ -21,7 +21,7 @@ CFLAGS = -Wall -O2 \
 all: $(APP_NAME)
 
 TEST_IMAGE = pocketbook-opds-client-tests
-TEST_SRC = tests/test_runner.c parser.c app_logic.c auth.c network.c
+TEST_SRC = tests/test_runner.c logger.c parser.c app_logic.c auth.c network.c
 
 test:
 	docker build -q -t $(TEST_IMAGE) -f tests/Dockerfile .

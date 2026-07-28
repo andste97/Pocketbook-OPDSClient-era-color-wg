@@ -121,12 +121,23 @@ Only password plus TOTP is supported. Duo, WebAuthn/passkeys, browser-cookie imp
 
 ## Debug Logging
 
-The app logs network requests and errors if a trigger file is present.
+Logging is always enabled so startup failures can be diagnosed. The app writes
+`/mnt/ext1/applications/OPDSClient/opds_client.log` from before InkView starts
+until shutdown. The log records startup and lifecycle events, configuration,
+UI actions, OPDS parsing, downloads, network results, and Authelia flow steps.
+Passwords, TOTP values, authorization and cookie headers, URL user information,
+queries, and fragments are not logged.
 
-**To enable and access logs:**
-1. Create an empty file named `LOGTRIGGER.TXT` in the app's installation folder (`/mnt/ext1/applications/OPDSClient/`).
-2. Run the application and perform the actions you wish to log.
-3. Open the `opds_client.log` file on your computer. This file contains `libcurl` network traces, HTTP headers, and redirect information. Authorization and cookie values are redacted.
+Fatal signals (`SIGSEGV`, `SIGABRT`, `SIGBUS`, `SIGILL`, and `SIGFPE`) are
+captured on an alternate signal stack. The crash handler avoids heap allocation
+and stdio, writing the signal, fault address, faulting program counter, return
+address where the architecture provides one, and stack/frame pointers before
+the process exits. Keep the matching `OPDSClient.app` binary if those addresses
+need to be symbolized.
+
+At startup, a log of 2 MB or larger is moved to
+`opds_client.previous.log`; only the current and previous logs are retained.
+Both files use owner-only permissions.
 
 I have tested on a Pocketbook ERA and Inkpad Color 3. I made the UI scalable but have not tested on any older or lower resolution devices.
 

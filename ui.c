@@ -290,10 +290,13 @@ void ShowDownloadProgress(long long total, long long current) {
 int CheckDownloadCancel() { return 0; }
 
 int EnsureNetwork() { 
+    LogMessage(LOG_LEVEL_INFO, "Requesting network connection");
     if (NetConnect(NULL) != 0) {
+        LogMessage(LOG_LEVEL_ERROR, "Network connection unavailable");
         Message(ICON_ERROR, "No Network", "Please turn on Wi-Fi to connect.", 3000);
         return -1; 
     }
+    LogMessage(LOG_LEVEL_INFO, "Network connection available");
     return 0; 
 }
 
@@ -576,6 +579,9 @@ static void AuthPasswordCallback(char *text) {
                                                 auth_flow.username,
                                                 auth_flow.password);
     SecureZero(auth_flow.password, sizeof(auth_flow.password));
+    LogMessage(result == AUTHELIA_OK ? LOG_LEVEL_INFO : LOG_LEVEL_ERROR,
+               "Authelia password step completed: server=%d result=%d",
+               current_server_index, (int)result);
     if (result != AUTHELIA_OK) {
         Message(ICON_ERROR, "Authelia Login", AutheliaResultMessage(result), 4000);
         AuthFlowCancel(&auth_flow);
@@ -614,6 +620,9 @@ static void AuthTOTPCallback(char *text) {
                                                  current_server_index,
                                                  auth_flow.totp);
     AuthFlowCancel(&auth_flow);
+    LogMessage(result == AUTHELIA_OK ? LOG_LEVEL_INFO : LOG_LEVEL_ERROR,
+               "Authelia TOTP step completed: server=%d result=%d",
+               current_server_index, (int)result);
     if (result != AUTHELIA_OK) {
         Message(ICON_ERROR, "Authelia Login", AutheliaResultMessage(result), 4000);
         Repaint();
@@ -660,6 +669,8 @@ void CancelAuthUI() {
 
 static void StartAutheliaLogin(void) {
     OPDSServer *server = &servers[current_server_index];
+    LogMessage(LOG_LEVEL_INFO, "User started Authelia login for server=%d",
+               current_server_index);
     if (server->auth_mode != AUTH_MODE_AUTHELIA_COOKIE ||
         strncmp(server->auth_url, "https://", 8) != 0) {
         Message(ICON_ERROR, "Authelia Configuration",
@@ -782,6 +793,7 @@ void FetchThumbnailsForPage() {
 }
 
 void LoadCatalog(const char *url) {
+    LogMessage(LOG_LEVEL_INFO, "Catalog load started for server=%d", current_server_index);
     if (EnsureNetwork() != 0) {
         if (current_state != STATE_BROWSING) {
             current_state = STATE_SERVER_OPTIONS;
@@ -812,8 +824,12 @@ void LoadCatalog(const char *url) {
         memset(current_entries, 0, sizeof(OPDSEntry) * MAX_ENTRIES);
         entry_count = 0; 
  
-        ParseOPDSFeed(chunk.memory, last_loaded_url);
+        int parse_result = ParseOPDSFeed(chunk.memory, last_loaded_url);
         free(chunk.memory);
+        if (parse_result != 0) {
+            LogMessage(LOG_LEVEL_ERROR, "Catalog parser failed for server=%d",
+                       current_server_index);
+        }
  
         StripHTML(current_feed_title);
         for (int i = 0; i < entry_count; i++) {
@@ -863,6 +879,9 @@ void LoadCatalog(const char *url) {
     }
 
     ManageImageCache();
+    LogMessage(fetch_result == NETWORK_OK ? LOG_LEVEL_INFO : LOG_LEVEL_ERROR,
+               "Catalog load finished: server=%d result=%d entries=%d",
+               current_server_index, (int)fetch_result, entry_count);
 }
 
 void URLEncode(const char *src, char *dest) {
@@ -890,6 +909,7 @@ void PerformSearch(char *text) {
         Message(ICON_ERROR, "Not Supported", "This OPDS server does not provide a search link.", 2000);
         Repaint(); return;
     }
+    LogMessage(LOG_LEVEL_INFO, "Catalog search started for server=%d", current_server_index);
 
     if (is_opensearch_url) {
         struct MemoryStruct osd_chunk;
@@ -995,6 +1015,7 @@ void HandleMainMenuTouch(int x, int y) {
         if (y >= list_y && y <= list_y + row_h) {
             FlashArea(margin * 2, list_y, sys_width - (margin * 4), row_h);
             current_server_index = i; 
+            LogMessage(LOG_LEVEL_INFO, "User selected server=%d", i);
             AuthPendingClear(&pending_auth_action);
             strncpy(current_host, servers[i].url, MAX_STR_LEN - 1);
             current_state = STATE_SERVER_OPTIONS; Repaint(); return; 
@@ -1008,11 +1029,13 @@ void HandleMainMenuTouch(int x, int y) {
         temp_server.fetch_thumbs = 1; 
         temp_server.catalog_rows = 10;
         editing_server_index = -1;
+        LogMessage(LOG_LEVEL_INFO, "User opened new-server form");
         current_state = STATE_SERVER_FORM; Repaint(); return; 
     } 
     if (y >= list_y + row_h + (gap * 2)) {
         FlashArea(margin * 2, list_y + row_h + (gap * 2), sys_width - (margin * 4), row_h);
 
+        LogMessage(LOG_LEVEL_INFO, "User requested application exit");
         Message(ICON_INFORMATION, "Exiting", "Cleaning up...", 0); Repaint();
         ManageImageCache(); TriggerLibraryRefresh(); CloseApp(); 
     }
@@ -1068,6 +1091,8 @@ void HandleServerOptionsTouch(int x, int y) {
     if (y >= mid_y && y <= mid_y + row_h) {
         FlashArea(bx, mid_y, bw, row_h);
         int previous_count = server_count;
+        LogMessage(LOG_LEVEL_INFO, "User requested deletion of server=%d",
+                   current_server_index);
         OPDSServer previous_servers[MAX_SERVERS];
         memcpy(previous_servers, servers, sizeof(previous_servers));
         AuthPendingClear(&pending_auth_action);
@@ -1197,6 +1222,8 @@ void HandleServerFormTouch(int x, int y) {
                     Repaint();
                     return;
                 }
+                LogMessage(LOG_LEVEL_INFO, "Server settings saved (index=%d)",
+                           editing_server_index);
                 if (origin_changed && AuthDeleteCookieJar(editing_server_index) != 0) {
                     Message(ICON_ERROR, "Session Cleanup Failed",
                             "The server was saved, but its old session could not be removed.", 3500);
@@ -1629,6 +1656,8 @@ void DrawBookDetails() {
 static void DownloadSelectedFormat(int format_index) {
     OPDSEntry *e = &current_entries[selected_entry_index];
     if (format_index < 0 || format_index >= e->format_count) return;
+    LogMessage(LOG_LEVEL_INFO, "Book download selected: server=%d entry=%d format=%d",
+               current_server_index, selected_entry_index, format_index);
     if (EnsureNetwork() != 0) {
         Repaint();
         return;
@@ -1644,6 +1673,9 @@ static void DownloadSelectedFormat(int format_index) {
     NetworkResult result = DownloadBook(e->formats[format_index].url, tmp_path, server_fname,
                                         &servers[current_server_index],
                                         current_server_index);
+    LogMessage(result == NETWORK_OK ? LOG_LEVEL_INFO : LOG_LEVEL_ERROR,
+               "Book transfer returned: server=%d result=%d",
+               current_server_index, (int)result);
     if (result == NETWORK_OK) {
         if (strlen(server_fname) == 0) {
             snprintf(server_fname, sizeof(server_fname), "%s.%s",

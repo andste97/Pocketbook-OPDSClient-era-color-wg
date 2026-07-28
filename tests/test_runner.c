@@ -51,7 +51,6 @@ typedef struct {
 #define ASSERT_EQ_INT(expected, actual) ASSERT_TRUE((expected) == (actual))
 #define ASSERT_STREQ(expected, actual) ASSERT_TRUE(strcmp((expected), (actual)) == 0)
 
-void LogDebug(const char *msg) { (void)msg; }
 void ShowDownloadProgress(long long total, long long current) { (void)total; (void)current; }
 int CheckDownloadCancel(void) { return 0; }
 
@@ -364,6 +363,7 @@ static void test_authelia_success_flow(void) {
 
 static void test_network_helpers(void) {
     char output[256];
+    char long_request[768];
     OPDSServer server;
     memset(&server, 0, sizeof(server));
     server.auth_mode = AUTH_MODE_AUTHELIA_COOKIE;
@@ -376,6 +376,23 @@ static void test_network_helpers(void) {
     ASSERT_STREQ("Cookie: [REDACTED]", output);
     RedactHTTPHeader("Content-Type: application/atom+xml", output, sizeof(output));
     ASSERT_STREQ("Content-Type: application/atom+xml", output);
+    RedactHTTPHeader("GET /opds?token=hidden HTTP/1.1", output, sizeof(output));
+    ASSERT_STREQ("GET /opds?[REDACTED] HTTP/1.1", output);
+    RedactHTTPHeader("GET /opds?token=hidden", output, sizeof(output));
+    ASSERT_STREQ("GET /opds?[REDACTED]", output);
+    memcpy(long_request, "GET /", 5);
+    memset(long_request + 5, 'a', 600);
+    strcpy(long_request + 605, "?token=hidden HTTP/1.1");
+    RedactHTTPHeader(long_request, output, sizeof(output));
+    ASSERT_STREQ("GET [TRUNCATED AND REDACTED] HTTP/1.1", output);
+    RedactHTTPHeader("Location: https://auth.example.com/callback?code=hidden",
+                     output, sizeof(output));
+    ASSERT_STREQ("Location: https://auth.example.com/callback?[REDACTED]", output);
+    RedactURLForLog("https://user@books.example.com/opds?token=secret#fragment",
+                    output, sizeof(output));
+    ASSERT_STREQ("https://[REDACTED]@books.example.com/opds?[REDACTED]", output);
+    RedactURLForLog("https://books.example.com/opds#private", output, sizeof(output));
+    ASSERT_STREQ("https://books.example.com/opds#[REDACTED]", output);
 
     ASSERT_TRUE(URLsHaveSameOrigin("https://books.example.com/a", "https://books.example.com/b"));
     ASSERT_TRUE(URLsHaveSameOrigin("https://books.example.com", "https://books.example.com:443/path"));
