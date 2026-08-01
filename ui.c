@@ -550,25 +550,52 @@ void SeparateTags(char *text) {
 void KbdCallback(char *text) { Repaint(); }
 
 static void AuthURLCallback(char *text) {
+    LogMessage(LOG_LEVEL_INFO,
+               "Authelia URL keyboard callback: server=%d text_present=%d length=%lu",
+               current_server_index, text != NULL,
+               (unsigned long)(text ? strlen(text) : 0));
     if (text && current_server_index >= 0 && current_server_index < server_count) {
         servers[current_server_index].auth_url[MAX_STR_LEN - 1] = '\0';
         if (SaveServers() != 0) {
+            LogMessage(LOG_LEVEL_ERROR,
+                       "Unable to save Authelia URL: server=%d", current_server_index);
             strncpy(servers[current_server_index].auth_url, auth_url_backup, MAX_STR_LEN - 1);
             servers[current_server_index].auth_url[MAX_STR_LEN - 1] = '\0';
             Message(ICON_ERROR, "Save Failed", "Unable to save the Authelia URL.", 3000);
         } else if (strcmp(servers[current_server_index].auth_url, auth_url_backup) != 0 &&
                    AuthDeleteCookieJar(current_server_index) != 0) {
+            LogMessage(LOG_LEVEL_ERROR,
+                       "Authelia URL saved but session cleanup failed: server=%d",
+                       current_server_index);
             Message(ICON_ERROR, "Session Cleanup Failed",
                     "The URL was saved, but the old session could not be removed.", 3500);
+        } else {
+            LogMessage(LOG_LEVEL_INFO,
+                       "Authelia URL callback completed: server=%d changed=%d",
+                       current_server_index,
+                       strcmp(servers[current_server_index].auth_url, auth_url_backup) != 0);
         }
+    } else {
+        LogMessage(LOG_LEVEL_WARNING,
+                   "Authelia URL edit canceled or server index invalid: server=%d count=%d",
+                   current_server_index, server_count);
     }
     Repaint();
 }
 
 static void AuthTOTPCallback(char *text);
+static void OpenAuthPasswordKeyboard(void);
+static void OpenAuthTOTPKeyboard(void);
 
 static void AuthPasswordCallback(char *text) {
+    LogMessage(LOG_LEVEL_INFO,
+               "Authelia password keyboard callback: server=%d state=%d text_present=%d length=%lu",
+               current_server_index, (int)auth_flow.state, text != NULL,
+               (unsigned long)(text ? strlen(text) : 0));
     if (AuthFlowSetPassword(&auth_flow, text) != 0) {
+        LogMessage(LOG_LEVEL_WARNING,
+                   "Authelia password step canceled or rejected: server=%d state=%d",
+                   current_server_index, (int)auth_flow.state);
         AuthFlowCancel(&auth_flow);
         Repaint();
         return;
@@ -590,25 +617,71 @@ static void AuthPasswordCallback(char *text) {
     }
 
     SecureZero(auth_flow.totp, sizeof(auth_flow.totp));
-    OpenKeyboard("Authelia TOTP", auth_flow.totp, (int)sizeof(auth_flow.totp) - 1,
-                 KBD_NUMERIC, AuthTOTPCallback);
+    LogMessage(LOG_LEVEL_INFO, "Scheduling Authelia TOTP keyboard: server=%d",
+               current_server_index);
+    SetWeakTimer("authelia_totp_keyboard", OpenAuthTOTPKeyboard, 100);
 }
 
 static void AuthUsernameCallback(char *text) {
+    LogMessage(LOG_LEVEL_INFO,
+               "Authelia username keyboard callback: server=%d state=%d text_present=%d length=%lu",
+               current_server_index, (int)auth_flow.state, text != NULL,
+               (unsigned long)(text ? strlen(text) : 0));
     if (AuthFlowSetUsername(&auth_flow, text) != 0) {
+        LogMessage(LOG_LEVEL_WARNING,
+                   "Authelia username step canceled or rejected: server=%d state=%d",
+                   current_server_index, (int)auth_flow.state);
         AuthFlowCancel(&auth_flow);
         Repaint();
         return;
     }
 
     SecureZero(auth_flow.password, sizeof(auth_flow.password));
+    LogMessage(LOG_LEVEL_INFO, "Scheduling Authelia password keyboard: server=%d",
+               current_server_index);
+    SetWeakTimer("authelia_password_keyboard", OpenAuthPasswordKeyboard, 100);
+}
+
+static void OpenAuthPasswordKeyboard(void) {
+    LogMessage(LOG_LEVEL_INFO,
+               "Opening deferred Authelia password keyboard: server=%d state=%d keyboard_open=%d",
+               current_server_index, (int)auth_flow.state, IsKeyboardOpened());
+    if (auth_flow.state != AUTH_FLOW_PASSWORD || current_server_index < 0 ||
+        current_server_index >= server_count) {
+        LogMessage(LOG_LEVEL_WARNING,
+                   "Skipped stale Authelia password keyboard: server=%d count=%d state=%d",
+                   current_server_index, server_count, (int)auth_flow.state);
+        return;
+    }
     OpenKeyboard("Authelia Password", auth_flow.password,
                  (int)sizeof(auth_flow.password) - 1,
                  KBD_PASSWORD, AuthPasswordCallback);
 }
 
+static void OpenAuthTOTPKeyboard(void) {
+    LogMessage(LOG_LEVEL_INFO,
+               "Opening deferred Authelia TOTP keyboard: server=%d state=%d keyboard_open=%d",
+               current_server_index, (int)auth_flow.state, IsKeyboardOpened());
+    if (auth_flow.state != AUTH_FLOW_TOTP || current_server_index < 0 ||
+        current_server_index >= server_count) {
+        LogMessage(LOG_LEVEL_WARNING,
+                   "Skipped stale Authelia TOTP keyboard: server=%d count=%d state=%d",
+                   current_server_index, server_count, (int)auth_flow.state);
+        return;
+    }
+    OpenKeyboard("Authelia TOTP", auth_flow.totp, (int)sizeof(auth_flow.totp) - 1,
+                 KBD_NUMERIC, AuthTOTPCallback);
+}
+
 static void AuthTOTPCallback(char *text) {
+    LogMessage(LOG_LEVEL_INFO,
+               "Authelia TOTP keyboard callback: server=%d state=%d text_present=%d length=%lu",
+               current_server_index, (int)auth_flow.state, text != NULL,
+               (unsigned long)(text ? strlen(text) : 0));
     if (AuthFlowSetTOTP(&auth_flow, text) != 0) {
+        LogMessage(LOG_LEVEL_WARNING,
+                   "Authelia TOTP step canceled or rejected: server=%d state=%d",
+                   current_server_index, (int)auth_flow.state);
         Message(ICON_ERROR, "Invalid TOTP", "Enter a 6- or 8-digit code.", 3000);
         AuthCancelLogin(current_server_index);
         AuthFlowCancel(&auth_flow);
@@ -660,6 +733,12 @@ static void AuthTOTPCallback(char *text) {
 }
 
 void CancelAuthUI() {
+    LogMessage(LOG_LEVEL_INFO,
+               "Canceling Authelia UI: server=%d state=%d pending=%d keyboard_open=%d",
+               current_server_index, (int)auth_flow.state,
+               (int)pending_auth_action.type, IsKeyboardOpened());
+    ClearTimer(OpenAuthPasswordKeyboard);
+    ClearTimer(OpenAuthTOTPKeyboard);
     AuthFlowCancel(&auth_flow);
     AuthPendingClear(&pending_auth_action);
     if (current_server_index >= 0 && current_server_index < server_count) {
@@ -680,6 +759,9 @@ static void StartAutheliaLogin(void) {
     if (EnsureNetwork() != 0) return;
 
     AuthFlowStart(&auth_flow);
+    LogMessage(LOG_LEVEL_INFO,
+               "Opening Authelia username keyboard: server=%d state=%d keyboard_open=%d",
+               current_server_index, (int)auth_flow.state, IsKeyboardOpened());
     OpenKeyboard("Authelia Username", auth_flow.username,
                  (int)sizeof(auth_flow.username) - 1,
                  KBD_NORMAL, AuthUsernameCallback);
