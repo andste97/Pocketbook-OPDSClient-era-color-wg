@@ -117,11 +117,15 @@ int SaveServers() {
     
     int save_result = SaveConfig(cfg);
     CloseConfig(cfg);
-    if (save_result != 0 || chmod(NEW_CFG_FILE, 0600) != 0) {
-        LogMessage(LOG_LEVEL_ERROR,
-                   "Failed to save configuration or restrict permissions (save=%d errno=%d)",
+    // InkView's SaveConfig reports success with a non-negative value (1 when the file is written).
+    if (save_result < 0) {
+        LogMessage(LOG_LEVEL_ERROR, "Failed to save configuration (save=%d errno=%d)",
                    save_result, errno);
         return -1;
+    }
+    if (chmod(NEW_CFG_FILE, 0600) != 0) {
+        LogMessage(LOG_LEVEL_WARNING,
+                   "Failed to restrict configuration permissions: errno=%d", errno);
     }
     LogMessage(LOG_LEVEL_INFO, "Configuration saved successfully");
     return 0;
