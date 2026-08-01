@@ -71,14 +71,9 @@ static int RotateLogIfNeeded(void) {
     struct stat info;
     int result = 0;
 
-    if (chmod(PREVIOUS_LOG_FILE, 0600) != 0 && errno != ENOENT) result = -1;
     if (stat(LOG_FILE, &info) == 0 && info.st_size >= MAX_LOG_SIZE) {
-        if (chmod(LOG_FILE, 0600) != 0) result = -1;
         if (unlink(PREVIOUS_LOG_FILE) != 0 && errno != ENOENT) result = -1;
-        if (rename(LOG_FILE, PREVIOUS_LOG_FILE) != 0 ||
-            chmod(PREVIOUS_LOG_FILE, 0600) != 0) {
-            result = -1;
-        }
+        if (rename(LOG_FILE, PREVIOUS_LOG_FILE) != 0) result = -1;
     }
     return result;
 }
@@ -101,10 +96,8 @@ void InitLogger(void) {
         WriteAll(STDERR_FILENO, "OPDSClient: unable to open log file\n", 36);
         return;
     }
-    chmod(LOG_FILE, 0600);
     if (rotation_result != 0) {
-        LogMessage(LOG_LEVEL_WARNING, "Log rotation or permission update failed: errno=%d",
-                   rotation_errno);
+        LogMessage(LOG_LEVEL_WARNING, "Log rotation failed: errno=%d", rotation_errno);
     }
     LogMessage(LOG_LEVEL_INFO, "Logger initialized (pid=%ld)", (long)getpid());
 }

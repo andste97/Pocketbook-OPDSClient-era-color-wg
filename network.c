@@ -476,7 +476,7 @@ static int ConfigureCommonRequest(CURL *curl, const char *url, const OPDSServer 
 }
 
 static NetworkResult FinishRequest(CURL *curl, CURLcode code, const char *requested_url,
-                                   const OPDSServer *server, const char *cookie_path) {
+                                   const OPDSServer *server) {
     long http_code = 0;
     char *effective_url = NULL;
     char *redirect_url = NULL;
@@ -497,7 +497,6 @@ static NetworkResult FinishRequest(CURL *curl, CURLcode code, const char *reques
                (int)code, curl_easy_strerror(code), http_code, (int)result,
                log_url);
     curl_easy_cleanup(curl);
-    if (cookie_path && cookie_path[0]) chmod(cookie_path, 0600);
     return result;
 }
 
@@ -544,7 +543,7 @@ NetworkResult FetchFeed(const char *url, const OPDSServer *server, int server_in
     curl_easy_setopt(curl, CURLOPT_HEADERDATA, NULL);
 
     code = curl_easy_perform(curl);
-    NetworkResult result = FinishRequest(curl, code, safe_url, server, cookie_path);
+    NetworkResult result = FinishRequest(curl, code, safe_url, server);
     LogDebug("================ NETWORK REQUEST END ================");
 
     if (result != NETWORK_OK) {
@@ -602,7 +601,7 @@ NetworkResult DownloadBook(const char *url, const char *filepath, char *server_f
     }
 
     code = curl_easy_perform(curl);
-    NetworkResult result = FinishRequest(curl, code, safe_url, server, cookie_path);
+    NetworkResult result = FinishRequest(curl, code, safe_url, server);
     fclose(file);
     LogDebug("================ DOWNLOAD REQUEST END ================");
 
@@ -644,7 +643,7 @@ NetworkResult DownloadImage(const char *url, const char *filepath, const OPDSSer
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteFileCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, file);
     code = curl_easy_perform(curl);
-    NetworkResult result = FinishRequest(curl, code, safe_url, server, cookie_path);
+    NetworkResult result = FinishRequest(curl, code, safe_url, server);
     fclose(file);
 
     if (result != NETWORK_OK) {

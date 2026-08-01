@@ -123,10 +123,6 @@ int SaveServers() {
                    save_result, errno);
         return -1;
     }
-    if (chmod(NEW_CFG_FILE, 0600) != 0) {
-        LogMessage(LOG_LEVEL_WARNING,
-                   "Failed to restrict configuration permissions: errno=%d", errno);
-    }
     LogMessage(LOG_LEVEL_INFO, "Configuration saved successfully");
     return 0;
 }
@@ -176,10 +172,6 @@ void LoadServers() {
             }
 
             CloseConfig(cfg);
-            if (chmod(NEW_CFG_FILE, 0600) != 0) {
-                LogMessage(LOG_LEVEL_WARNING,
-                           "Failed to restrict configuration permissions: errno=%d", errno);
-            }
             LogMessage(LOG_LEVEL_INFO, "Loaded %d server(s) from current configuration",
                        server_count);
         } else {

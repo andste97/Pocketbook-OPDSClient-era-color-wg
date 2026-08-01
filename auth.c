@@ -198,14 +198,6 @@ static AutheliaResult PerformAuthRequest(const OPDSServer *server, int server_in
 
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
-    if (access(cookie_path, F_OK) == 0 && chmod(cookie_path, 0600) != 0) {
-        SecureZero(response->data, response->size);
-        free(response->data);
-        response->data = NULL;
-        LogMessage(LOG_LEVEL_ERROR, "Unable to restrict cookie-jar permissions: errno=%d",
-                   errno);
-        return AUTHELIA_COOKIE_ERROR;
-    }
 
     if (code != CURLE_OK) {
         AutheliaResult result = ClassifyTransportError(code);
@@ -289,10 +281,10 @@ static AutheliaResult VerifyAndCommitSession(const OPDSServer *server, int serve
         LogMessage(LOG_LEVEL_ERROR, "Session verification returned HTTP %ld", http_code);
         return AUTHELIA_HTTP_ERROR;
     }
-    if (!CookieJarIsUsable(staging_path) || chmod(staging_path, 0600) != 0) {
+    if (!CookieJarIsUsable(staging_path)) {
         return AUTHELIA_COOKIE_ERROR;
     }
-    if (rename(staging_path, persistent_path) != 0 || chmod(persistent_path, 0600) != 0) {
+    if (rename(staging_path, persistent_path) != 0) {
         LogMessage(LOG_LEVEL_ERROR, "Unable to commit session cookie for server=%d: errno=%d",
                    server_index, errno);
         return AUTHELIA_COOKIE_ERROR;
