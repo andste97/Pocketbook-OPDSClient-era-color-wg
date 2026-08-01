@@ -9,7 +9,6 @@
 #include <unistd.h>
 
 #define AUTH_RESPONSE_LIMIT 65536
-#define DEVICE_CA_BUNDLE "/ebrmain/share/ssl/certs/ca-certificates.crt"
 
 typedef struct {
     char *data;
@@ -172,8 +171,9 @@ static AutheliaResult PerformAuthRequest(const OPDSServer *server, int server_in
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-    if (access(DEVICE_CA_BUNDLE, R_OK) == 0) {
-        curl_easy_setopt(curl, CURLOPT_CAINFO, DEVICE_CA_BUNDLE);
+    const char *ca_bundle = ResolveCABundlePath();
+    if (ca_bundle) {
+        curl_easy_setopt(curl, CURLOPT_CAINFO, ca_bundle);
     }
     curl_easy_setopt(curl, CURLOPT_COOKIEFILE, cookie_path);
     curl_easy_setopt(curl, CURLOPT_COOKIEJAR, cookie_path);
@@ -250,8 +250,9 @@ static AutheliaResult VerifyAndCommitSession(const OPDSServer *server, int serve
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-    if (access(DEVICE_CA_BUNDLE, R_OK) == 0) {
-        curl_easy_setopt(curl, CURLOPT_CAINFO, DEVICE_CA_BUNDLE);
+    const char *ca_bundle = ResolveCABundlePath();
+    if (ca_bundle) {
+        curl_easy_setopt(curl, CURLOPT_CAINFO, ca_bundle);
     }
     curl_easy_setopt(curl, CURLOPT_COOKIEFILE, staging_path);
     curl_easy_setopt(curl, CURLOPT_COOKIEJAR, staging_path);

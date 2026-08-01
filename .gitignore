@@ -1,0 +1,4 @@
+*.o
+/OPDSClient.app
+/tests/test_runner
+dist

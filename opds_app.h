@@ -156,6 +156,7 @@ void LogMessage(LogLevel level, const char *format, ...)
     __attribute__((format(printf, 2, 3)));
 void InitNetwork(void);
 void CleanupNetwork(void);
+const char *ResolveCABundlePath(void);
 void EnsureAbsoluteURL(const char *in_url, char *out_url);
 void RedactHTTPHeader(const char *line, char *out, size_t out_size);
 void RedactURLForLog(const char *url, char *out, size_t out_size);

@@ -7,7 +7,14 @@
 #include <strings.h>
 #include <unistd.h>
 
-#define DEVICE_CA_BUNDLE "/ebrmain/share/ssl/certs/ca-certificates.crt"
+// libcurl is linked statically, so its compile-time CA path does not exist on
+// the device; probe the known firmware trust stores instead.
+static const char *const CA_BUNDLE_CANDIDATES[] = {
+    "/ebrmain/share/ssl/certs/ca-certificates.crt",
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/ebrmain/config/ca-certificates.crt",
+    "/mnt/ext1/applications/OPDSClient/ca-certificates.crt",
+};
 
 extern void LogDebug(const char *msg);
 extern void ShowDownloadProgress(long long total, long long current);
@@ -27,6 +34,24 @@ void InitNetwork(void) {
                        curl_easy_strerror(result));
         }
     }
+}
+
+const char *ResolveCABundlePath(void) {
+    static const char *resolved;
+    static int resolved_once;
+    size_t i;
+
+    if (resolved_once) return resolved;
+    resolved_once = 1;
+    for (i = 0; i < sizeof(CA_BUNDLE_CANDIDATES) / sizeof(CA_BUNDLE_CANDIDATES[0]); i++) {
+        if (access(CA_BUNDLE_CANDIDATES[i], R_OK) == 0) {
+            resolved = CA_BUNDLE_CANDIDATES[i];
+            LogMessage(LOG_LEVEL_INFO, "Using CA bundle %s", resolved);
+            return resolved;
+        }
+    }
+    LogMessage(LOG_LEVEL_ERROR, "No CA bundle found; HTTPS verification will fail");
+    return NULL;
 }
 
 void CleanupNetwork(void) {
@@ -439,8 +464,9 @@ static int ConfigureCommonRequest(CURL *curl, const char *url, const OPDSServer 
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-    if (access(DEVICE_CA_BUNDLE, R_OK) == 0) {
-        curl_easy_setopt(curl, CURLOPT_CAINFO, DEVICE_CA_BUNDLE);
+    const char *ca_bundle = ResolveCABundlePath();
+    if (ca_bundle) {
+        curl_easy_setopt(curl, CURLOPT_CAINFO, ca_bundle);
     }
     curl_easy_setopt(curl, CURLOPT_DEBUGFUNCTION, DebugCallback);
     curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
