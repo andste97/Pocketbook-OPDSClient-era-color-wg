@@ -75,10 +75,11 @@ all: $(APP_NAME)
 
 TEST_IMAGE = pocketbook-opds-client-tests
 TEST_SRC = tests/test_runner.c logger.c parser.c app_logic.c auth.c network.c
+TEST_DOCKER_ARGS ?=
 
 test:
 	docker build -q -t $(TEST_IMAGE) -f tests/Dockerfile .
-	docker run --rm -v "$(CURDIR):/project" -w /project $(TEST_IMAGE) \
+	docker run --rm $(TEST_DOCKER_ARGS) -v "$(CURDIR):/project" -w /project $(TEST_IMAGE) \
 		sh -lc 'gcc -std=c11 -Wall -Wextra -Werror -DEMULATOR -DUNIT_TEST -I. \
 		$$(pkg-config --cflags libxml-2.0 libcurl json-c freetype2) \
 		$(TEST_SRC) -o tests/test_runner \

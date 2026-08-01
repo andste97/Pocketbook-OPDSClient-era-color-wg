@@ -24,7 +24,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Run unit tests
-        run: make test
+        run: make test TEST_DOCKER_ARGS="--user $(id -u):$(id -g)"
 
       # OpenSSL, curl and c-ares are cross-built from source; the pinned
       # versions live in the Makefile, so its hash is the cache key.
@@ -40,6 +40,8 @@ jobs:
         run: |
           docker pull "$SDK_IMAGE"
           docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --env HOME=/tmp \
             -v "$GITHUB_WORKSPACE:/project" \
             -w /project \
             "$SDK_IMAGE" \
