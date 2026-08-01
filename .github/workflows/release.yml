@@ -26,6 +26,16 @@ jobs:
       - name: Run unit tests
         run: make test
 
+      # OpenSSL, curl and c-ares are cross-built from source; the pinned
+      # versions live in the Makefile, so its hash is the cache key.
+      - name: Cache cross-built dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            third_party/prefix
+            third_party/stamps
+          key: deps-${{ env.SDK_IMAGE }}-${{ hashFiles('Makefile') }}
+
       - name: Build with PocketBook SDK 6.8 B300
         run: |
           docker pull "$SDK_IMAGE"
@@ -33,7 +43,7 @@ jobs:
             -v "$GITHUB_WORKSPACE:/project" \
             -w /project \
             "$SDK_IMAGE" \
-            -lc 'export LD_LIBRARY_PATH="$SDK_BASE/usr/lib"; make clean; make SDK_PATH="$SDK_BASE/usr"'
+            -lc 'export LD_LIBRARY_PATH="$SDK_BASE/usr/lib"; make clean; make -j"$(nproc)" SDK_PATH="$SDK_BASE/usr"'
 
       - name: Validate application binary
         run: |
