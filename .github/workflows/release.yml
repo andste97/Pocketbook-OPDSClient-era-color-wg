@@ -30,17 +30,18 @@ jobs:
         run: |
           docker pull "$SDK_IMAGE"
           docker run --rm \
-            -u "$(id -u):$(id -g)" \
             -v "$GITHUB_WORKSPACE:/project" \
             -w /project \
             "$SDK_IMAGE" \
-            -lc 'set -euo pipefail; export LD_LIBRARY_PATH="$SDK_BASE/usr/lib"; make clean; make -j"$(nproc)" SDK_PATH="$SDK_BASE/usr"'
+            -lc 'export LD_LIBRARY_PATH="$SDK_BASE/usr/lib"; make clean; make bundle SDK_PATH="$SDK_BASE/usr"'
 
-      - name: Validate application binary
+      - name: Validate application bundle
         run: |
-          test -s OPDSClient.app
+          test -s dist/OPDSClient.app
+          test -s dist/OPDSClient/lib/libssl.so.1.0.0
+          test -s dist/OPDSClient/lib/libcrypto.so.1.0.0
 
-          file_output="$(file OPDSClient.app)"
+          file_output="$(file dist/OPDSClient.app)"
           echo "$file_output"
           grep -q 'ELF 32-bit.*ARM' <<<"$file_output"
 
@@ -51,7 +52,7 @@ jobs:
             -lc '
               set -euo pipefail
               export LD_LIBRARY_PATH="$SDK_BASE/usr/lib"
-              readelf_output="$("$SDK_BASE/usr/bin/arm-obreey-linux-gnueabi-readelf" -h OPDSClient.app)"
+              readelf_output="$("$SDK_BASE/usr/bin/arm-obreey-linux-gnueabi-readelf" -h dist/OPDSClient.app)"
               echo "$readelf_output"
               grep -q "Machine:.*ARM" <<<"$readelf_output"
               grep -q "Version5 EABI, soft-float ABI" <<<"$readelf_output"
@@ -66,11 +67,13 @@ jobs:
           echo "id=$release_id" >> "$GITHUB_OUTPUT"
           echo "title=PocketBook OPDS Client ${timestamp}-${short_sha}" >> "$GITHUB_OUTPUT"
 
-      - name: Package application
+      - name: Package application bundle
         run: |
-          tar -czf OPDSClient.tar.gz OPDSClient.app
+          tar -C dist -czf OPDSClient.tar.gz OPDSClient.app OPDSClient
           test -s OPDSClient.tar.gz
           tar -tzf OPDSClient.tar.gz | grep -qx 'OPDSClient.app'
+          tar -tzf OPDSClient.tar.gz | grep -qx 'OPDSClient/lib/libssl.so.1.0.0'
+          tar -tzf OPDSClient.tar.gz | grep -qx 'OPDSClient/lib/libcrypto.so.1.0.0'
 
       - name: Publish GitHub release
         env:
