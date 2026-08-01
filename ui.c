@@ -584,8 +584,6 @@ static void AuthURLCallback(char *text) {
 }
 
 static void AuthTOTPCallback(char *text);
-static void OpenAuthPasswordKeyboard(void);
-static void OpenAuthTOTPKeyboard(void);
 
 static void AuthPasswordCallback(char *text) {
     LogMessage(LOG_LEVEL_INFO,
@@ -617,9 +615,10 @@ static void AuthPasswordCallback(char *text) {
     }
 
     SecureZero(auth_flow.totp, sizeof(auth_flow.totp));
-    LogMessage(LOG_LEVEL_INFO, "Scheduling Authelia TOTP keyboard: server=%d",
+    LogMessage(LOG_LEVEL_INFO, "Opening Authelia TOTP keyboard: server=%d",
                current_server_index);
-    SetWeakTimer("authelia_totp_keyboard", OpenAuthTOTPKeyboard, 100);
+    OpenKeyboard("Authelia TOTP", auth_flow.totp, (int)sizeof(auth_flow.totp) - 1,
+                 KBD_NUMERIC, AuthTOTPCallback);
 }
 
 static void AuthUsernameCallback(char *text) {
@@ -637,40 +636,11 @@ static void AuthUsernameCallback(char *text) {
     }
 
     SecureZero(auth_flow.password, sizeof(auth_flow.password));
-    LogMessage(LOG_LEVEL_INFO, "Scheduling Authelia password keyboard: server=%d",
+    LogMessage(LOG_LEVEL_INFO, "Opening Authelia password keyboard: server=%d",
                current_server_index);
-    SetWeakTimer("authelia_password_keyboard", OpenAuthPasswordKeyboard, 100);
-}
-
-static void OpenAuthPasswordKeyboard(void) {
-    LogMessage(LOG_LEVEL_INFO,
-               "Opening deferred Authelia password keyboard: server=%d state=%d keyboard_open=%d",
-               current_server_index, (int)auth_flow.state, IsKeyboardOpened());
-    if (auth_flow.state != AUTH_FLOW_PASSWORD || current_server_index < 0 ||
-        current_server_index >= server_count) {
-        LogMessage(LOG_LEVEL_WARNING,
-                   "Skipped stale Authelia password keyboard: server=%d count=%d state=%d",
-                   current_server_index, server_count, (int)auth_flow.state);
-        return;
-    }
     OpenKeyboard("Authelia Password", auth_flow.password,
                  (int)sizeof(auth_flow.password) - 1,
                  KBD_PASSWORD, AuthPasswordCallback);
-}
-
-static void OpenAuthTOTPKeyboard(void) {
-    LogMessage(LOG_LEVEL_INFO,
-               "Opening deferred Authelia TOTP keyboard: server=%d state=%d keyboard_open=%d",
-               current_server_index, (int)auth_flow.state, IsKeyboardOpened());
-    if (auth_flow.state != AUTH_FLOW_TOTP || current_server_index < 0 ||
-        current_server_index >= server_count) {
-        LogMessage(LOG_LEVEL_WARNING,
-                   "Skipped stale Authelia TOTP keyboard: server=%d count=%d state=%d",
-                   current_server_index, server_count, (int)auth_flow.state);
-        return;
-    }
-    OpenKeyboard("Authelia TOTP", auth_flow.totp, (int)sizeof(auth_flow.totp) - 1,
-                 KBD_NUMERIC, AuthTOTPCallback);
 }
 
 static void AuthTOTPCallback(char *text) {
@@ -737,8 +707,6 @@ void CancelAuthUI() {
                "Canceling Authelia UI: server=%d state=%d pending=%d keyboard_open=%d",
                current_server_index, (int)auth_flow.state,
                (int)pending_auth_action.type, IsKeyboardOpened());
-    ClearTimer(OpenAuthPasswordKeyboard);
-    ClearTimer(OpenAuthTOTPKeyboard);
     AuthFlowCancel(&auth_flow);
     AuthPendingClear(&pending_auth_action);
     if (current_server_index >= 0 && current_server_index < server_count) {

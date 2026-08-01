@@ -288,12 +288,21 @@ static int main_handler(int event, int a, int b) {
             break;
 
         case EVT_SHOW:
-        case EVT_FOREGROUND:
-            LogMessage(LOG_LEVEL_INFO, "Application shown/foregrounded (event=%d)", event);
+        case EVT_FOREGROUND: {
+            int keyboard_open = IsKeyboardOpened();
+            LogMessage(LOG_LEVEL_INFO,
+                       "Application shown/foregrounded: event=%d keyboard_open=%d",
+                       event, keyboard_open);
             // Handle app un-minimization or device waking from sleep
-            SetPanelType(0); 
-            Repaint();       
+            if (keyboard_open) {
+                LogMessage(LOG_LEVEL_INFO,
+                           "Skipping panel and page updates while InkView keyboard is active");
+            } else {
+                SetPanelType(0);
+                Repaint();
+            }
             break;
+        }
             
         case EVT_BACKGROUND:
             // Handle device sleep or app minimization
