@@ -33,15 +33,13 @@ jobs:
             -v "$GITHUB_WORKSPACE:/project" \
             -w /project \
             "$SDK_IMAGE" \
-            -lc 'export LD_LIBRARY_PATH="$SDK_BASE/usr/lib"; make clean; make bundle SDK_PATH="$SDK_BASE/usr"'
+            -lc 'export LD_LIBRARY_PATH="$SDK_BASE/usr/lib"; make clean; make SDK_PATH="$SDK_BASE/usr"'
 
-      - name: Validate application bundle
+      - name: Validate application binary
         run: |
-          test -s dist/OPDSClient.app
-          test -s dist/OPDSClient/lib/libssl.so.1.0.0
-          test -s dist/OPDSClient/lib/libcrypto.so.1.0.0
+          test -s OPDSClient.app
 
-          file_output="$(file dist/OPDSClient.app)"
+          file_output="$(file OPDSClient.app)"
           echo "$file_output"
           grep -q 'ELF 32-bit.*ARM' <<<"$file_output"
 
@@ -52,10 +50,21 @@ jobs:
             -lc '
               set -euo pipefail
               export LD_LIBRARY_PATH="$SDK_BASE/usr/lib"
-              readelf_output="$("$SDK_BASE/usr/bin/arm-obreey-linux-gnueabi-readelf" -h dist/OPDSClient.app)"
-              echo "$readelf_output"
-              grep -q "Machine:.*ARM" <<<"$readelf_output"
-              grep -q "Version5 EABI, soft-float ABI" <<<"$readelf_output"
+              readelf="$SDK_BASE/usr/bin/arm-obreey-linux-gnueabi-readelf"
+              header="$("$readelf" -h OPDSClient.app)"
+              echo "$header"
+              grep -q "Machine:.*ARM" <<<"$header"
+              grep -q "Version5 EABI, soft-float ABI" <<<"$header"
+
+              # Only libinkview and glibc may remain dynamic; anything else is a
+              # firmware-version dependency the app is not allowed to acquire.
+              needed="$("$readelf" -d OPDSClient.app | sed -n "s/.*NEEDED.*\[\(.*\)\]/\1/p")"
+              echo "$needed"
+              unexpected="$(grep -vE "^(libinkview\.so|lib(c|m|dl|pthread|rt)\.so\.[0-9]+)$" <<<"$needed" || true)"
+              if [ -n "$unexpected" ]; then
+                echo "Unexpected dynamic dependencies: $unexpected" >&2
+                exit 1
+              fi
             '
 
       - name: Create release identifier
@@ -67,13 +76,11 @@ jobs:
           echo "id=$release_id" >> "$GITHUB_OUTPUT"
           echo "title=PocketBook OPDS Client ${timestamp}-${short_sha}" >> "$GITHUB_OUTPUT"
 
-      - name: Package application bundle
+      - name: Package application
         run: |
-          tar -C dist -czf OPDSClient.tar.gz OPDSClient.app OPDSClient
+          tar -czf OPDSClient.tar.gz OPDSClient.app
           test -s OPDSClient.tar.gz
           tar -tzf OPDSClient.tar.gz | grep -qx 'OPDSClient.app'
-          tar -tzf OPDSClient.tar.gz | grep -qx 'OPDSClient/lib/libssl.so.1.0.0'
-          tar -tzf OPDSClient.tar.gz | grep -qx 'OPDSClient/lib/libcrypto.so.1.0.0'
 
       - name: Publish GitHub release
         env:

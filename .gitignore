@@ -1,4 +1,5 @@
 *.o
 /OPDSClient.app
 /tests/test_runner
+/third_party
 dist
